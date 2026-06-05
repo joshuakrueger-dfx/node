@@ -1,0 +1,45 @@
+{
+  "header": "PAYMENT-SIGNATURE",
+  "base64": "eyJ4NDAyVmVyc2lvbiI6MiwicmVzb3VyY2UiOnsidXJsIjoiaHR0cHM6Ly9hcGkuZXhhbXBsZS5jb20vdjEvd2VhdGhlci9jdXJyZW50IiwiZGVzY3JpcHRpb24iOiJvcGFxdWU6d2VhdGhlci5jdXJyZW50LnYxIiwibWltZVR5cGUiOiJhcHBsaWNhdGlvbi9qc29uIn0sImFjY2VwdGVkIjp7InNjaGVtZSI6InprY29pbnMtcHVibGlzaGVyIiwibmV0d29yayI6InprY29pbnM6bXV0aW55bmV0IiwiYW1vdW50IjoiMjUiLCJhc3NldCI6ImJ0Yy1zYXRzIiwicGF5VG8iOiJtZXJjaGFudF8wMUowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsIm1heFRpbWVvdXRTZWNvbmRzIjozMCwiZXh0cmEiOnsibW9kZSI6ImV4YWN0LXBheW1lbnQtaW50ZW50IiwiZmFjaWxpdGF0b3IiOiJodHRwczovL3B1Ymxpc2hlci5leGFtcGxlLmNvbSIsInJlc291cmNlSWQiOiJ3ZWF0aGVyLmN1cnJlbnQudjEiLCJyZXNvdXJjZUhhc2giOiJzaGEyNTY6NGY3ZDBjMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsImFjY2Vzc1RocmVzaG9sZCI6InB1Ymxpc2hlcl9hY2NlcHRlZCJ9fSwicGF5bG9hZCI6eyJpbnRlbnRJZCI6InpraW50ZW50XzAxSjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwiYXV0aG9yaXphdGlvbklkIjpudWxsLCJ2b3VjaGVySWQiOiJ6a3ZfMDFKMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLCJwYXllciI6InprcGF5ZXJfZjkzMDhhMDE5MjU4YzMxMDQ5MzQ0Zjg1Zjg5ZDUyMjliNTMxYzg0NTgzNmY5OWIwODYwMWYxMTNiY2UwMzZmOSIsIm1lcmNoYW50IjoibWVyY2hhbnRfMDFKMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLCJhbW91bnQiOiIyNSIsImZlZUFtb3VudCI6IjEiLCJhc3NldCI6ImJ0Yy1zYXRzIiwicmVzb3VyY2VIYXNoIjoic2hhMjU2OjRmN2QwYzAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAiLCJyZXF1ZXN0SGFzaCI6InNoYTI1Njo3NjFiOGQ1YTcyOTQ4YzczYzBlMmI3MDMzMDlkNzYwMzA0NWY0MzZjODMxNzEzOWY3NDNkZTBmZDY2MjNlMjgyIiwidmFsaWRBZnRlciI6IjE3Nzk5MDAwMDAiLCJ2YWxpZEJlZm9yZSI6IjE3Nzk5MDAwMzAiLCJub25jZSI6IkFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUEiLCJzaWduYXR1cmVTY2hlbWUiOiJiaXAzNDAtc2Nobm9yciIsInNpZ25hdHVyZSI6IkU5MDc4MzFGODA4NDhEMTA2OUE1MzcxQjQwMjQxMDM2NEJERjFDNUY4MzA3QjAwODRDNTVGMUNFMkRDQTgyMTUyNUY2NkE0QTg1RUE4QjcxRTQ4MkE3NEYzODJEMkNFNUVCRUVFOEZEQjIxNzJGNDc3REY0OTAwRDMxMDUzNkMwIn0sImV4dGVuc2lvbnMiOnt9fQ==",
+  "decoded": {
+    "x402Version": 2,
+    "resource": {
+      "url": "https://api.example.com/v1/weather/current",
+      "description": "opaque:weather.current.v1",
+      "mimeType": "application/json"
+    },
+    "accepted": {
+      "scheme": "zkcoins-publisher",
+      "network": "zkcoins:mutinynet",
+      "amount": "25",
+      "asset": "btc-sats",
+      "payTo": "merchant_01J00000000000000000000000",
+      "maxTimeoutSeconds": 30,
+      "extra": {
+        "mode": "exact-payment-intent",
+        "facilitator": "https://publisher.example.com",
+        "resourceId": "weather.current.v1",
+        "resourceHash": "sha256:4f7d0c0000000000000000000000000000000000000000000000000000000000000",
+        "accessThreshold": "publisher_accepted"
+      }
+    },
+    "payload": {
+      "intentId": "zkintent_01J00000000000000000000000",
+      "authorizationId": null,
+      "voucherId": "zkv_01J00000000000000000000000",
+      "payer": "zkpayer_f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+      "merchant": "merchant_01J00000000000000000000000",
+      "amount": "25",
+      "feeAmount": "1",
+      "asset": "btc-sats",
+      "resourceHash": "sha256:4f7d0c0000000000000000000000000000000000000000000000000000000000000",
+      "requestHash": "sha256:761b8d5a72948c73c0e2b703309d7603045f436c8317139f743de0fd6623e282",
+      "validAfter": "1779900000",
+      "validBefore": "1779900030",
+      "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "signatureScheme": "bip340-schnorr",
+      "signature": "E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA821525F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0"
+    },
+    "extensions": {}
+  }
+}

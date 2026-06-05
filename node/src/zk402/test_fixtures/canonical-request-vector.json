@@ -1,0 +1,19 @@
+{
+  "description": "GET request with sorted duplicate query keys and one selected header",
+  "request": {
+    "method": "GET",
+    "url": "https://api.example.com/v1/weather/current?b=2&a=1&a=0",
+    "headers": {
+      "x-zk402-resource-id": "weather.current.v1",
+      "authorization": "Bearer ignored"
+    },
+    "bodyHex": ""
+  },
+  "selectedHeadersCanonical": "x-zk402-resource-id:weather.current.v1\n",
+  "selectedHeadersHash": "sha256:fb903a7e2cb9d7c2039489d04eab25853731f1db956bcb3035df0e16ec8e09c3",
+  "bodyHash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "resourceHash": "sha256:4f7d0c0000000000000000000000000000000000000000000000000000000000000",
+  "canonical": "ZK402-REQUEST-V1\nmethod=GET\nscheme=https\nhost=api.example.com\npath=/v1/weather/current\nquery=a=0&a=1&b=2\nheaders=sha256:fb903a7e2cb9d7c2039489d04eab25853731f1db956bcb3035df0e16ec8e09c3\nbody=sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nresource_hash=sha256:4f7d0c0000000000000000000000000000000000000000000000000000000000000",
+  "requestHash": "sha256:761b8d5a72948c73c0e2b703309d7603045f436c8317139f743de0fd6623e282"
+}
+
