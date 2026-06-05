@@ -43,6 +43,10 @@ NKEYS=$(echo "$KEYS" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("en
 [ "$NKEYS" -ge 1 ] && echo "  ok: receipt-keys advertised ($NKEYS)" || { echo "  FAIL: no receipt keys"; FAIL=1; }
 
 echo "== 4. streaming meter (Claude tokens) =="
+# Fresh channel per run (postgres persists across runs; the monotone
+# cumulative guard would reject a repeated seq/cumulative otherwise).
+FRESH=$(curl -sf -X POST "$API/api/zk402/authorizations" -H 'content-type: application/json' -d "{\"payer\":\"$PAYER\",\"network\":\"zkcoins:regtest\",\"expiresAt\":\"$(date -u -r $((NOW+86400)) +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d @$((NOW+86400)) +%Y-%m-%dT%H:%M:%SZ)\",\"allowedMerchants\":[\"merchant_demo\"],\"spendLimitTotal\":\"100000\",\"facilitator\":\"http://localhost:4242\",\"signature\":\"demo\"}" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).authorizationId))')
+CHAN="$FRESH"
 STREAM=$(node e2e-agent.mjs stream "{\"sk\":\"$BUYER\",\"network\":\"zkcoins:regtest\",\"channelId\":\"$CHAN\",\"voucherSeq\":1,\"merchant\":\"merchant_demo\",\"maxAmount\":100,\"cumulativeAuthorized\":100,\"resourceHash\":\"sha256:aa\",\"requestHash\":\"sha256:s1\",\"validAfter\":$((NOW-10)),\"validBefore\":$((NOW+60)),\"facilitator\":\"http://localhost:4242\",\"accessThreshold\":\"metered\",\"usage\":[{\"unit\":\"output_tokens\",\"quantity\":1000000,\"unitPriceMicrosats\":15,\"model\":\"claude-sonnet-4-6\"}]}")
 METER=$(curl -sf -X POST "$API/v2/x402/stream/meter" -H 'content-type: application/json' -d "$STREAM")
 chk "meter.success" "$(echo "$METER" | j '"success"')" "true"

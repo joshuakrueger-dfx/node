@@ -218,3 +218,56 @@ async fn dashboard_reads_require_key_and_scope_to_merchant() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["payments"].as_array().unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn receipts_endpoint_returns_full_signed_receipt() {
+    use super::canonical::voucher_signing_digest;
+    use super::payload::ParsedPayment;
+    let (app, _key, scope) = env().await;
+    let (kp, payer) = keypair();
+    let now = Utc::now().timestamp();
+
+    // Settle an exact payment to mint a receipt.
+    let mut p = ParsedPayment {
+        scheme: "zkcoins-publisher".to_owned(),
+        network: "zkcoins:regtest".to_owned(),
+        mode: "exact-payment-intent".to_owned(),
+        facilitator: "https://f.test".to_owned(),
+        access_threshold: "publisher_accepted".to_owned(),
+        intent_id: "zki_r".to_owned(),
+        authorization_id: None,
+        voucher_id: "zkv_r".to_owned(),
+        payer: payer.clone(),
+        merchant: "merchant_1".to_owned(),
+        amount_sats: 25,
+        fee_amount_sats: 1,
+        asset: "btc-sats".to_owned(),
+        resource_hash: "sha256:aa".to_owned(),
+        request_hash: "sha256:bb".to_owned(),
+        valid_after: now - 10,
+        valid_before: now + 30,
+        nonce: "n_r".to_owned(),
+        signature_scheme: "bip340-schnorr".to_owned(),
+        signature: String::new(),
+    };
+    let msg = bitcoin::secp256k1::Message::from_digest_slice(&voucher_signing_digest(
+        &p.voucher_fields(),
+    ))
+    .unwrap();
+    p.signature = hex::encode(SECP256K1.sign_schnorr_no_aux_rand(&msg, &kp).serialize());
+    let env_json = json!({ "x402Version": 2, "paymentPayload": { "accepted": { "scheme": p.scheme, "network": p.network, "amount": "25", "asset": "btc-sats", "payTo": p.merchant, "maxTimeoutSeconds": 30, "extra": { "mode": p.mode, "facilitator": p.facilitator, "resourceId": "x", "resourceHash": p.resource_hash, "accessThreshold": p.access_threshold } }, "payload": { "intentId": p.intent_id, "authorizationId": null, "voucherId": p.voucher_id, "payer": p.payer, "merchant": p.merchant, "amount": "25", "feeAmount": "1", "asset": "btc-sats", "resourceHash": p.resource_hash, "requestHash": p.request_hash, "validAfter": p.valid_after.to_string(), "validBefore": p.valid_before.to_string(), "nonce": p.nonce, "signatureScheme": "bip340-schnorr", "signature": p.signature } } });
+    let (_s, settle) = post(&app, "/v2/x402/settle", &env_json).await;
+    let receipt_id = settle["extensions"]["zk402"]["receiptId"].as_str().unwrap();
+
+    // Fetch the full receipt; it carries the Ed25519 signature + kid.
+    let (status, full) = get_auth(&app, &format!("/api/zk402/receipts/{receipt_id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(full["receiptId"], receipt_id);
+    assert_eq!(full["amount"], "25");
+    assert!(full["signature"].as_str().unwrap().len() > 40);
+    assert_eq!(full["signatureAlgorithm"], "Ed25519");
+
+    // Unknown id → 404.
+    let (status, _b) = get_auth(&app, "/api/zk402/receipts/zkr_nope", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

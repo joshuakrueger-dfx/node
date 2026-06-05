@@ -459,6 +459,18 @@ pub async fn insert_receipt(
     Ok(res.rows_affected() == 1)
 }
 
+/// Load a receipt by its own id (the public, offline-verifiable artifact
+/// served at `GET /api/zk402/receipts/:id`).
+pub async fn load_receipt_json(
+    pool: &PgPool,
+    receipt_id: &str,
+) -> Result<Option<serde_json::Value>, sqlx::Error> {
+    sqlx::query_scalar("SELECT receipt_json FROM zk402_receipts WHERE id = $1")
+        .bind(receipt_id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Load the receipt for a payment intent (the idempotent-retry read:
 /// same voucher ⇒ same receipt).
 pub async fn load_receipt_for_intent(

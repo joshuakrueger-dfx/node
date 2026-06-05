@@ -62,6 +62,10 @@ pub fn create_zk402_router(state: Zk402State) -> Router {
         )
         .route("/api/zk402/merchants", post(onboard_handler))
         .route(
+            "/api/zk402/receipts/:id",
+            axum::routing::get(get_receipt_handler),
+        )
+        .route(
             "/api/zk402/dashboard/summary",
             axum::routing::get(dashboard_summary_handler),
         )
@@ -644,4 +648,21 @@ async fn dashboard_usage_handler(
         StatusCode::OK,
         Json(json!({ "merchantId": merchant, "channel": q.channel, "usage": items })),
     )
+}
+
+/// `GET /api/zk402/receipts/:id` — the full signed receipt (public,
+/// offline-verifiable against `/api/zk402/receipt-keys`).
+async fn get_receipt_handler(
+    State(s): State<Zk402State>,
+    Path(id): Path<String>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    match super::store::load_receipt_json(&s.pool, &id).await {
+        Ok(Some(v)) => (StatusCode::OK, Json(v)),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" }))),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "unavailable" })),
+        ),
+    }
 }
