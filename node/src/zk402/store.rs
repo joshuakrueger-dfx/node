@@ -199,6 +199,38 @@ pub async fn update_authorization_status(
     Ok(res.rows_affected() == 1)
 }
 
+/// Atomically reserve `amount` against an authorization's total cap.
+///
+/// This is the concurrency-safe heart of non-custodial spend control:
+/// the guard lives entirely inside one conditional `UPDATE`, so N
+/// parallel vouchers serialize on the row lock and the sum of accepted
+/// amounts can NEVER exceed `authorized_amount_sats` (nor the optional
+/// `spend_limit_total_sats`). Returns `true` when the reservation
+/// succeeded, `false` when it would breach a cap or the authorization is
+/// not `active`. The per-request cap, expiry window, and merchant
+/// allow-list are checked by the caller against the loaded row; only the
+/// running-total guard must be atomic, and it is.
+pub async fn try_reserve_authorization(
+    pool: &PgPool,
+    id: &str,
+    amount: i64,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE zk402_authorizations \
+         SET accepted_amount_sats = accepted_amount_sats + $2, updated_at = now() \
+         WHERE id = $1 \
+           AND status = 'active' \
+           AND accepted_amount_sats + $2 <= authorized_amount_sats \
+           AND (spend_limit_total_sats IS NULL \
+                OR accepted_amount_sats + $2 <= spend_limit_total_sats)",
+    )
+    .bind(id)
+    .bind(amount)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 // ---- payment intents ------------------------------------------------------
 
 /// Insert a payment intent. Idempotent on `id` (a facilitator HTTP

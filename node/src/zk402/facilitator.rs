@@ -219,6 +219,27 @@ pub async fn settle(
         Err(_) => return Err(Zk402Error::SettlementQueueUnavailable),
     }
 
+    // Authorization-mode voucher: validate against the signed session
+    // and atomically reserve against its cap. The intent is already
+    // persisted (replay-safe), so a cap rejection here marks it failed
+    // rather than leaking an unrecorded grant. Exact intents (no
+    // authorizationId) skip this entirely.
+    if payload.authorization_id.is_some() {
+        if let Err(e) =
+            super::authorization::accept_voucher_against_authorization(pool, payload, now).await
+        {
+            let _ = store::fail_payment_intent(
+                pool,
+                &payload.intent_id,
+                PaymentIntentStatus::FailedTerminal,
+                e.code(),
+                "authorization check failed",
+            )
+            .await;
+            return Err(e);
+        }
+    }
+
     // Publisher acceptance (mocked today). On failure, record the
     // terminal reason on the intent and surface the structured error.
     let publisher_acceptance_id = match publisher.accept(payload) {

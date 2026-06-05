@@ -30,6 +30,7 @@
 //! called from a production route (that lands in Step 3). The same
 //! posture the `db` module carried during its initial PR (PR-A1).
 
+pub mod authorization;
 pub mod canonical;
 pub mod error;
 pub mod facilitator;
@@ -40,6 +41,8 @@ pub mod signature;
 pub mod store;
 pub mod types;
 
+#[cfg(test)]
+mod authorization_tests;
 #[cfg(test)]
 mod facilitator_tests;
 #[cfg(test)]
