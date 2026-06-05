@@ -31,12 +31,14 @@
 //! posture the `db` module carried during its initial PR (PR-A1).
 
 pub mod authorization;
+pub mod batch;
 pub mod canonical;
 pub mod error;
 pub mod facilitator;
 pub mod payload;
 pub mod receipt;
 pub mod routes;
+pub mod settlement;
 pub mod signature;
 pub mod store;
 pub mod types;
@@ -44,7 +46,11 @@ pub mod types;
 #[cfg(test)]
 mod authorization_tests;
 #[cfg(test)]
+mod batch_tests;
+#[cfg(test)]
 mod facilitator_tests;
+#[cfg(test)]
+mod settlement_tests;
 #[cfg(test)]
 mod sig_tests;
 #[cfg(test)]
