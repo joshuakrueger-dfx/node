@@ -33,8 +33,10 @@
 pub mod authorization;
 pub mod batch;
 pub mod canonical;
+pub mod dashboard;
 pub mod error;
 pub mod facilitator;
+pub mod hardening;
 pub mod payload;
 pub mod receipt;
 pub mod routes;
@@ -48,10 +50,16 @@ mod authorization_tests;
 #[cfg(test)]
 mod batch_tests;
 #[cfg(test)]
+mod dashboard_tests;
+#[cfg(test)]
 mod facilitator_tests;
+#[cfg(test)]
+mod hardening_tests;
 #[cfg(test)]
 mod settlement_tests;
 #[cfg(test)]
 mod sig_tests;
+#[cfg(test)]
+mod spec_lock_tests;
 #[cfg(test)]
 mod tests;

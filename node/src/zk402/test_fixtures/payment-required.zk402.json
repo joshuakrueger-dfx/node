@@ -1,0 +1,33 @@
+{
+  "header": "PAYMENT-REQUIRED",
+  "base64": "eyJ4NDAyVmVyc2lvbiI6MiwiZXJyb3IiOiJQQVlNRU5ULVNJR05BVFVSRSBoZWFkZXIgaXMgcmVxdWlyZWQiLCJyZXNvdXJjZSI6eyJ1cmwiOiJodHRwczovL2FwaS5leGFtcGxlLmNvbS92MS93ZWF0aGVyL2N1cnJlbnQiLCJkZXNjcmlwdGlvbiI6Im9wYXF1ZTp3ZWF0aGVyLmN1cnJlbnQudjEiLCJtaW1lVHlwZSI6ImFwcGxpY2F0aW9uL2pzb24iLCJzZXJ2aWNlTmFtZSI6IkV4YW1wbGUgV2VhdGhlciIsInRhZ3MiOlsid2VhdGhlciIsImFwaSJdfSwiYWNjZXB0cyI6W3sic2NoZW1lIjoiemtjb2lucy1wdWJsaXNoZXIiLCJuZXR3b3JrIjoiemtjb2luczptdXRpbnluZXQiLCJhbW91bnQiOiIyNSIsImFzc2V0IjoiYnRjLXNhdHMiLCJwYXlUbyI6Im1lcmNoYW50XzAxSjAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwibWF4VGltZW91dFNlY29uZHMiOjMwLCJleHRyYSI6eyJtb2RlIjoiZXhhY3QtcGF5bWVudC1pbnRlbnQiLCJmYWNpbGl0YXRvciI6Imh0dHBzOi8vcHVibGlzaGVyLmV4YW1wbGUuY29tIiwicmVzb3VyY2VJZCI6IndlYXRoZXIuY3VycmVudC52MSIsInJlc291cmNlSGFzaCI6InNoYTI1Njo0ZjdkMGMwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwiYWNjZXNzVGhyZXNob2xkIjoicHVibGlzaGVyX2FjY2VwdGVkIn19XSwiZXh0ZW5zaW9ucyI6e319",
+  "decoded": {
+    "x402Version": 2,
+    "error": "PAYMENT-SIGNATURE header is required",
+    "resource": {
+      "url": "https://api.example.com/v1/weather/current",
+      "description": "opaque:weather.current.v1",
+      "mimeType": "application/json",
+      "serviceName": "Example Weather",
+      "tags": ["weather", "api"]
+    },
+    "accepts": [
+      {
+        "scheme": "zkcoins-publisher",
+        "network": "zkcoins:mutinynet",
+        "amount": "25",
+        "asset": "btc-sats",
+        "payTo": "merchant_01J00000000000000000000000",
+        "maxTimeoutSeconds": 30,
+        "extra": {
+          "mode": "exact-payment-intent",
+          "facilitator": "https://publisher.example.com",
+          "resourceId": "weather.current.v1",
+          "resourceHash": "sha256:4f7d0c0000000000000000000000000000000000000000000000000000000000000",
+          "accessThreshold": "publisher_accepted"
+        }
+      }
+    ],
+    "extensions": {}
+  }
+}

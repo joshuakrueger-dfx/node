@@ -54,6 +54,21 @@ pub fn create_zk402_router(state: Zk402State) -> Router {
             "/api/zk402/authorizations/:id/revoke",
             post(revoke_authorization_handler),
         )
+        // Dashboard & operations (Step 9). NOTE: deliberately NO
+        // withdraw/payout route exists — the operator custodies nothing.
+        .route(
+            "/api/zk402/receipt-keys",
+            axum::routing::get(receipt_keys_handler),
+        )
+        .route("/api/zk402/merchants", post(onboard_handler))
+        .route(
+            "/api/zk402/dashboard/summary",
+            axum::routing::get(dashboard_summary_handler),
+        )
+        .route(
+            "/api/zk402/dashboard/batches",
+            axum::routing::get(dashboard_batches_handler),
+        )
         .with_state(state)
 }
 
@@ -284,4 +299,154 @@ async fn revoke_authorization_handler(
         Ok(a) => auth_response_json(&a),
         Err(e) => auth_error_json(e),
     }
+}
+
+// ---- dashboard & operations (Step 9) ----------------------------------------
+
+use axum::http::HeaderMap;
+
+/// Extract the bearer API key from `Authorization: Bearer` or `X-API-Key`.
+fn api_key_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        return Some(v.to_owned());
+    }
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_owned)
+}
+
+/// Resolve the authenticated merchant, or return a 401 JSON body.
+async fn authed_merchant(
+    s: &Zk402State,
+    headers: &HeaderMap,
+) -> Result<String, (u16, Json<Value>)> {
+    let key = api_key_from_headers(headers).ok_or((
+        401u16,
+        Json(json!({ "error": "unauthorized", "message": "missing API key" })),
+    ))?;
+    match super::dashboard::authenticate(&s.pool, &key).await {
+        Ok(Some(m)) => Ok(m),
+        Ok(None) => Err((
+            401,
+            Json(json!({ "error": "unauthorized", "message": "invalid or revoked API key" })),
+        )),
+        Err(_) => Err((503, Json(json!({ "error": "unavailable" })))),
+    }
+}
+
+async fn onboard_handler(
+    State(s): State<Zk402State>,
+    Json(req): Json<Value>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    let id = req.get("merchantId").and_then(Value::as_str);
+    let name = req.get("displayName").and_then(Value::as_str);
+    let addr = req.get("settlementAddress").and_then(Value::as_str);
+    let (id, name, addr) = match (id, name, addr) {
+        (Some(i), Some(n), Some(a)) => (i, n, a),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_payload" })),
+            )
+        }
+    };
+    // Issue a fresh secret key (shown once).
+    let key = format!("zk402_sk_{}", random_token());
+    match super::dashboard::onboard_merchant(&s.pool, id, name, addr, &key).await {
+        Ok(o) => (
+            StatusCode::CREATED,
+            Json(json!({ "merchantId": o.merchant_id, "apiKey": o.api_key })),
+        ),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.code() }))),
+    }
+}
+
+/// 24-byte base64url random token (API-key suffix), from the OS CSPRNG
+/// via ring.
+pub fn random_token() -> String {
+    use ring::rand::SecureRandom;
+    let mut b = [0u8; 24];
+    ring::rand::SystemRandom::new()
+        .fill(&mut b)
+        .expect("system RNG");
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, b)
+}
+
+async fn dashboard_summary_handler(
+    State(s): State<Zk402State>,
+    headers: HeaderMap,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    let merchant = match authed_merchant(&s, &headers).await {
+        Ok(m) => m,
+        Err((code, body)) => return (StatusCode::from_u16(code).unwrap(), body),
+    };
+    let summary = super::dashboard::settlement_summary(&s.pool, &merchant)
+        .await
+        .unwrap_or_default();
+    let fees = super::dashboard::fee_analytics(&s.pool, &merchant)
+        .await
+        .unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "merchantId": merchant,
+            "settlement": {
+                "acceptedSats": summary.accepted_sats.to_string(),
+                "publishedSats": summary.published_sats.to_string(),
+                "confirmedSats": summary.confirmed_sats.to_string(),
+                "finalSats": summary.final_sats.to_string(),
+                "feeSats": summary.fee_sats.to_string(),
+                "reversalSats": summary.reversal_sats.to_string(),
+            },
+            "analytics": {
+                "intentCount": fees.intent_count,
+                "grossSats": fees.gross_sats.to_string(),
+                "feeSats": fees.fee_sats.to_string(),
+                "netSats": fees.net_sats.to_string(),
+            },
+        })),
+    )
+}
+
+async fn dashboard_batches_handler(
+    State(s): State<Zk402State>,
+    headers: HeaderMap,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    let merchant = match authed_merchant(&s, &headers).await {
+        Ok(m) => m,
+        Err((code, body)) => return (StatusCode::from_u16(code).unwrap(), body),
+    };
+    let batches = super::dashboard::list_batches(&s.pool, &merchant)
+        .await
+        .unwrap_or_default();
+    let items: Vec<Value> = batches
+        .iter()
+        .map(|b| {
+            json!({
+                "id": b.id,
+                "status": b.status.as_str(),
+                "grossSats": b.gross_amount_sats.to_string(),
+                "feeSats": b.fee_amount_sats.to_string(),
+                "netSats": b.net_amount_sats.to_string(),
+                "intentCount": b.intent_count,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({ "merchantId": merchant, "batches": items })),
+    )
+}
+
+/// `GET /api/zk402/receipt-keys` — the active receipt-signing key
+/// registry (Step 10). Third parties resolve a receipt's `kid` here to
+/// verify its Ed25519 signature offline.
+async fn receipt_keys_handler(State(s): State<Zk402State>) -> Json<Value> {
+    let registry = super::hardening::KeyRegistry::new(&s.signer.kid, s.signer.public_key_bytes());
+    Json(registry.to_json())
 }
