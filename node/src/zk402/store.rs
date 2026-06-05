@@ -390,6 +390,25 @@ pub async fn update_payment_intent_status(
     Ok(res.rows_affected() == 1)
 }
 
+/// Persist the zkCoins publisher-acceptance id on an intent (settle
+/// records it as soon as the publisher accepts; Step-8's real backend
+/// reuses the same column).
+pub async fn set_publisher_acceptance_id(
+    pool: &PgPool,
+    id: &str,
+    acceptance_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE zk402_payment_intents \
+         SET publisher_acceptance_id = $2, updated_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .bind(acceptance_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 /// Record a structured failure on a payment intent.
 pub async fn fail_payment_intent(
     pool: &PgPool,

@@ -74,7 +74,8 @@ async fn connect_and_migrate_creates_all_tables() {
     //   * After 0014 (jobs):             23 tables + 1 view (#161
     //     introduces the async Job-API state table.)
     //   * After 0015 (zk402):            31 tables + 1 view
-    //   * After 0016 (zk402 api keys):    32 tables + 1 view (ZK402
+    //   * After 0016 (zk402 api keys):    32 tables + 1 view
+    //   * After 0017 (zk402 streaming):    33 tables + 1 view (ZK402
     //     publisher payment layer — Step 1 DB & domain; see
     //     `node/src/zk402/`.)
     assert_eq!(
@@ -113,6 +114,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "zk402_merchants".to_string(),
             "zk402_payment_intents".to_string(),
             "zk402_receipts".to_string(),
+            "zk402_usage_events".to_string(),
         ]
     );
 }

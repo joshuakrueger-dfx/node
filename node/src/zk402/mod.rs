@@ -43,6 +43,7 @@ pub mod routes;
 pub mod settlement;
 pub mod signature;
 pub mod store;
+pub mod streaming;
 pub mod types;
 
 #[cfg(test)]
@@ -61,5 +62,7 @@ mod settlement_tests;
 mod sig_tests;
 #[cfg(test)]
 mod spec_lock_tests;
+#[cfg(test)]
+mod streaming_tests;
 #[cfg(test)]
 mod tests;

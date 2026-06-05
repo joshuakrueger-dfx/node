@@ -404,3 +404,25 @@ fn our_canonical_matches_fixture_field_set() {
     // sanity: the verify response shape we mirror in routes::settle_handler
     let _ = json!({"success": true});
 }
+
+#[tokio::test]
+async fn settle_persists_publisher_acceptance_id() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    active_merchant(pool, "merchant_1").await;
+    let (kp, payer) = test_keypair();
+    let now = 1_779_900_000;
+    let p = signed_payload(&kp, &payer, "merchant_1", "zkv_1", "n1", 25, now);
+    settle(pool, &signer(), &mock_publisher(), &p, now)
+        .await
+        .unwrap();
+    let intent = store::load_payment_intent_by_voucher(pool, "zkv_1")
+        .await
+        .unwrap()
+        .unwrap();
+    // MockPublisherAccept returns "pubacc_<voucher>" — it is now persisted.
+    assert_eq!(
+        intent.publisher_acceptance_id.as_deref(),
+        Some("pubacc_zkv_1")
+    );
+}

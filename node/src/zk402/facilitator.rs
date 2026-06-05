@@ -273,7 +273,8 @@ pub async fn settle(
         now_dt,
     )
     .await;
-    let _ = publisher_acceptance_id; // persisted with the intent in Step 8
+    let _ = store::set_publisher_acceptance_id(pool, &payload.intent_id, &publisher_acceptance_id)
+        .await;
 
     // Issue + persist the signed receipt. status = publisher_accepted
     // (the access-granting state), settlementState = queued (as of issuance).

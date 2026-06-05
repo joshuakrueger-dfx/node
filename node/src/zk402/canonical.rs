@@ -297,3 +297,71 @@ pub fn voucher_signing_digest(f: &VoucherFields) -> [u8; 32] {
     hasher.update(canonical_voucher_message(f));
     hasher.finalize().into()
 }
+
+// ---- ZK402-STREAM-V1 (Flow-D streaming "up-to" voucher) ---------------------
+
+/// The fields of a streaming voucher's canonical signed message. The
+/// buyer signs ONE of these per inference: `max_amount_sats` is the
+/// ceiling for THIS request, `cumulative_authorized_sats` is the
+/// monotone running total across the channel (the replay guard).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamVoucherFields {
+    pub network: String,
+    pub channel_id: String,
+    pub voucher_seq: i64,
+    pub payer: String,
+    pub merchant: String,
+    pub max_amount_sats: i64,
+    pub cumulative_authorized_sats: i64,
+    pub resource_hash: String,
+    pub request_hash: String,
+    pub valid_after: i64,
+    pub valid_before: i64,
+    pub facilitator: String,
+    pub access_threshold: String,
+}
+
+/// Canonical `ZK402-STREAM-V1` bytes — same byte discipline as
+/// `ZK402-V1` (ASCII, LF, fixed order, no trailing newline). Must stay
+/// byte-identical to the TS encoder in `@zk402/sdk`.
+pub fn canonical_stream_message(f: &StreamVoucherFields) -> Vec<u8> {
+    format!(
+        "ZK402-STREAM-V1\n\
+         scheme=zkcoins-publisher\n\
+         network={}\n\
+         channel_id={}\n\
+         voucher_seq={}\n\
+         payer={}\n\
+         merchant={}\n\
+         asset=btc-sats\n\
+         max_amount={}\n\
+         cumulative_authorized={}\n\
+         resource_hash={}\n\
+         request_hash={}\n\
+         valid_after={}\n\
+         valid_before={}\n\
+         facilitator={}\n\
+         access_threshold={}",
+        f.network,
+        f.channel_id,
+        f.voucher_seq,
+        f.payer,
+        f.merchant,
+        f.max_amount_sats,
+        f.cumulative_authorized_sats,
+        f.resource_hash,
+        f.request_hash,
+        f.valid_after,
+        f.valid_before,
+        f.facilitator,
+        f.access_threshold,
+    )
+    .into_bytes()
+}
+
+/// The 32-byte BIP-340 signing digest for a streaming voucher.
+pub fn stream_signing_digest(f: &StreamVoucherFields) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_stream_message(f));
+    hasher.finalize().into()
+}
