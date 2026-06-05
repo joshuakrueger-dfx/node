@@ -57,6 +57,8 @@ mod facilitator_tests;
 #[cfg(test)]
 mod hardening_tests;
 #[cfg(test)]
+mod routes_extra_tests;
+#[cfg(test)]
 mod settlement_tests;
 #[cfg(test)]
 mod sig_tests;

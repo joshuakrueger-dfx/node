@@ -69,6 +69,20 @@ pub fn create_zk402_router(state: Zk402State) -> Router {
             "/api/zk402/dashboard/batches",
             axum::routing::get(dashboard_batches_handler),
         )
+        .route(
+            "/api/zk402/dashboard/payments",
+            axum::routing::get(dashboard_payments_handler),
+        )
+        .route(
+            "/api/zk402/dashboard/channels",
+            axum::routing::get(dashboard_channels_handler),
+        )
+        .route(
+            "/api/zk402/dashboard/usage",
+            axum::routing::get(dashboard_usage_handler),
+        )
+        // ZK402-Stream (Flow-D) metering — the LLM-token billing hot path.
+        .route("/v2/x402/stream/meter", post(stream_meter_handler))
         .with_state(state)
 }
 
@@ -449,4 +463,185 @@ async fn dashboard_batches_handler(
 async fn receipt_keys_handler(State(s): State<Zk402State>) -> Json<Value> {
     let registry = super::hardening::KeyRegistry::new(&s.signer.kid, s.signer.public_key_bytes());
     Json(registry.to_json())
+}
+
+// ---- streaming meter + dashboard reads (test environment / frontend) --------
+
+use axum::extract::Query;
+
+/// Accept a JSON integer that may arrive as a number or a numeric string.
+fn as_i64(v: &Value, key: &str) -> Result<i64, Zk402Error> {
+    match v.get(key) {
+        Some(Value::Number(n)) => n.as_i64().ok_or(Zk402Error::InvalidPayload),
+        Some(Value::String(s)) => s.parse::<i64>().map_err(|_| Zk402Error::InvalidPayload),
+        _ => Err(Zk402Error::InvalidPayload),
+    }
+}
+
+fn as_str_field(v: &Value, key: &str) -> Result<String, Zk402Error> {
+    v.get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or(Zk402Error::InvalidPayload)
+}
+
+/// `POST /v2/x402/stream/meter` — meter actual usage under a signed
+/// ZK402-STREAM-V1 voucher. Body:
+/// `{ streamVoucher: {...}, signature, usage: [{unit,quantity,unitPriceMicrosats,model}] }`.
+async fn stream_meter_handler(State(s): State<Zk402State>, Json(req): Json<Value>) -> Json<Value> {
+    let now = chrono::Utc::now().timestamp();
+    let build = || -> Result<(super::canonical::StreamVoucherFields, String, Vec<super::streaming::Usage>), Zk402Error> {
+        let v = req.get("streamVoucher").ok_or(Zk402Error::InvalidPayload)?;
+        let fields = super::canonical::StreamVoucherFields {
+            network: as_str_field(v, "network")?,
+            channel_id: as_str_field(v, "channelId")?,
+            voucher_seq: as_i64(v, "voucherSeq")?,
+            payer: as_str_field(v, "payer")?,
+            merchant: as_str_field(v, "merchant")?,
+            max_amount_sats: as_i64(v, "maxAmount")?,
+            cumulative_authorized_sats: as_i64(v, "cumulativeAuthorized")?,
+            resource_hash: as_str_field(v, "resourceHash")?,
+            request_hash: as_str_field(v, "requestHash")?,
+            valid_after: as_i64(v, "validAfter")?,
+            valid_before: as_i64(v, "validBefore")?,
+            facilitator: as_str_field(v, "facilitator")?,
+            access_threshold: as_str_field(v, "accessThreshold")?,
+        };
+        let signature = as_str_field(&req, "signature")?;
+        let usage = req
+            .get("usage")
+            .and_then(Value::as_array)
+            .ok_or(Zk402Error::InvalidPayload)?
+            .iter()
+            .map(|u| {
+                Ok(super::streaming::Usage {
+                    unit: as_str_field(u, "unit")?,
+                    quantity: as_i64(u, "quantity")?,
+                    unit_price_microsats: as_i64(u, "unitPriceMicrosats")?,
+                    model: u.get("model").and_then(Value::as_str).map(str::to_owned),
+                })
+            })
+            .collect::<Result<Vec<_>, Zk402Error>>()?;
+        Ok((fields, signature, usage))
+    };
+    let (fields, signature, usage) = match build() {
+        Ok(x) => x,
+        Err(e) => return Json(json!({ "success": false, "errorReason": e.code() })),
+    };
+    match super::streaming::meter(&s.pool, &fields, &signature, &usage, now).await {
+        Ok(o) => Json(json!({
+            "success": true,
+            "channelId": fields.channel_id,
+            "actualCostSats": o.actual_cost_sats.to_string(),
+            "unspentSats": o.unspent_sats.to_string(),
+            "meteredTotalSats": o.metered_total_sats.to_string(),
+            "cumulativeAuthorizedSats": o.cumulative_authorized_sats.to_string(),
+        })),
+        Err(e) => Json(json!({
+            "success": false,
+            "errorReason": e.code(),
+            "message": human_message(e),
+        })),
+    }
+}
+
+async fn dashboard_payments_handler(
+    State(s): State<Zk402State>,
+    headers: HeaderMap,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    let merchant = match authed_merchant(&s, &headers).await {
+        Ok(m) => m,
+        Err((code, body)) => return (StatusCode::from_u16(code).unwrap(), body),
+    };
+    let intents = super::store::list_payment_intents_for_merchant(&s.pool, &merchant, 100)
+        .await
+        .unwrap_or_default();
+    let items: Vec<Value> = intents
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "voucherId": p.voucher_id,
+                "amountSats": p.amount_sats.to_string(),
+                "feeSats": p.fee_amount_sats.to_string(),
+                "status": p.status.as_str(),
+                "accessThreshold": p.access_threshold.as_str(),
+                "createdAt": p.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({ "merchantId": merchant, "payments": items })),
+    )
+}
+
+async fn dashboard_channels_handler(
+    State(s): State<Zk402State>,
+    headers: HeaderMap,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    let merchant = match authed_merchant(&s, &headers).await {
+        Ok(m) => m,
+        Err((code, body)) => return (StatusCode::from_u16(code).unwrap(), body),
+    };
+    let channels = super::store::list_channels_for_merchant(&s.pool, &merchant, 100)
+        .await
+        .unwrap_or_default();
+    let items: Vec<Value> = channels
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.id,
+                "payer": c.payer,
+                "status": c.status,
+                "meteredSats": c.metered_amount_sats.to_string(),
+                "cumulativeAuthorizedSats": c.authorized_cumulative_sats.to_string(),
+                "capSats": c.authorized_amount_sats.to_string(),
+                "validBefore": c.valid_before.to_rfc3339(),
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({ "merchantId": merchant, "channels": items })),
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct ChannelQuery {
+    channel: String,
+}
+
+async fn dashboard_usage_handler(
+    State(s): State<Zk402State>,
+    headers: HeaderMap,
+    Query(q): Query<ChannelQuery>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    let merchant = match authed_merchant(&s, &headers).await {
+        Ok(m) => m,
+        Err((code, body)) => return (StatusCode::from_u16(code).unwrap(), body),
+    };
+    let events = super::store::list_usage_events(&s.pool, &q.channel, 100)
+        .await
+        .unwrap_or_default();
+    let items: Vec<Value> = events
+        .iter()
+        .map(|e| {
+            json!({
+                "voucherSeq": e.voucher_seq,
+                "unit": e.unit,
+                "quantity": e.quantity,
+                "costSats": e.cost_sats.to_string(),
+                "model": e.model,
+                "createdAt": e.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({ "merchantId": merchant, "channel": q.channel, "usage": items })),
+    )
 }

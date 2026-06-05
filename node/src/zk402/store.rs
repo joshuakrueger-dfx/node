@@ -752,3 +752,114 @@ pub async fn count_audit_events(
     .await?;
     Ok(count)
 }
+
+// ---- dashboard / streaming read helpers ------------------------------------
+
+/// List a merchant's payment intents, newest first (dashboard view).
+pub async fn list_payment_intents_for_merchant(
+    pool: &PgPool,
+    merchant_id: &str,
+    limit: i64,
+) -> Result<Vec<PaymentIntent>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, voucher_id, authorization_id, payer, merchant_id, network, \
+                asset, amount_sats, fee_amount_sats, resource_hash, request_hash, \
+                nonce, valid_after, valid_before, canonical_message, \
+                signature_scheme, signature, status, failure_code, \
+                failure_message, access_threshold, publisher_acceptance_id, \
+                created_at, updated_at \
+         FROM zk402_payment_intents WHERE merchant_id = $1 \
+         ORDER BY created_at DESC LIMIT $2",
+    )
+    .bind(merchant_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(parse_payment_intent_row).collect()
+}
+
+/// One metering-channel summary row for the dashboard.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelSummary {
+    pub id: String,
+    pub payer: String,
+    pub status: String,
+    pub metered_amount_sats: i64,
+    pub authorized_cumulative_sats: i64,
+    pub authorized_amount_sats: i64,
+    pub valid_before: DateTime<Utc>,
+}
+
+/// List metering channels visible to a merchant (allow-list contains the
+/// merchant, or is empty = any). Newest first.
+pub async fn list_channels_for_merchant(
+    pool: &PgPool,
+    merchant_id: &str,
+    limit: i64,
+) -> Result<Vec<ChannelSummary>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, payer, status, metered_amount_sats, \
+                authorized_cumulative_sats, authorized_amount_sats, valid_before \
+         FROM zk402_authorizations \
+         WHERE channel_mode = 'metering' \
+           AND (allowed_merchants = '[]'::jsonb OR allowed_merchants @> $1::jsonb) \
+         ORDER BY created_at DESC LIMIT $2",
+    )
+    .bind(serde_json::json!([merchant_id]))
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(ChannelSummary {
+                id: r.try_get("id")?,
+                payer: r.try_get("payer")?,
+                status: r.try_get("status")?,
+                metered_amount_sats: r.try_get("metered_amount_sats")?,
+                authorized_cumulative_sats: r.try_get("authorized_cumulative_sats")?,
+                authorized_amount_sats: r.try_get("authorized_amount_sats")?,
+                valid_before: r.try_get("valid_before")?,
+            })
+        })
+        .collect()
+}
+
+/// One usage-event row for the dashboard.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageEventRow {
+    pub voucher_seq: i64,
+    pub unit: String,
+    pub quantity: i64,
+    pub cost_sats: i64,
+    pub model: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// List a channel's usage events, newest first.
+pub async fn list_usage_events(
+    pool: &PgPool,
+    channel_id: &str,
+    limit: i64,
+) -> Result<Vec<UsageEventRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT voucher_seq, unit, quantity, cost_sats, model, created_at \
+         FROM zk402_usage_events WHERE channel_id = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT $2",
+    )
+    .bind(channel_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(UsageEventRow {
+                voucher_seq: r.try_get("voucher_seq")?,
+                unit: r.try_get("unit")?,
+                quantity: r.try_get("quantity")?,
+                cost_sats: r.try_get("cost_sats")?,
+                model: r.try_get("model")?,
+                created_at: r.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
