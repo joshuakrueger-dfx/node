@@ -39,6 +39,11 @@ impl Default for BatchPolicy {
     }
 }
 
+/// One claimed intent row: `(intent_id, amount_sats, fee_amount_sats)`.
+type ClaimedIntent = (String, i64, i64);
+/// Intents grouped for one batch: `(merchant_id, network, items)`.
+type MerchantGroup = (String, String, Vec<ClaimedIntent>);
+
 fn ts(unix: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(unix, 0).single().unwrap_or_else(Utc::now)
 }
@@ -99,7 +104,7 @@ pub async fn run_batch_cycle(
     }
 
     // Group by merchant (preserving created_at order within groups).
-    let mut groups: Vec<(String, String, Vec<(String, i64, i64)>)> = Vec::new();
+    let mut groups: Vec<MerchantGroup> = Vec::new();
     for r in &rows {
         let merchant: String = r
             .try_get("merchant_id")
