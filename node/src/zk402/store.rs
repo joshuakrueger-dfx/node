@@ -18,8 +18,10 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use super::types::{
-    AuditEvent, Authorization, AuthorizationStatus, Merchant, MerchantStatus, NewAuthorization,
-    NewMerchant, NewPaymentIntent, PaymentIntent, PaymentIntentStatus, Receipt,
+    AuditEvent, Authorization, AuthorizationStatus, Batch, BatchItem, BatchStatus, Merchant,
+    MerchantSettlement, MerchantStatus, NewAuditEvent, NewAuthorization, NewBatch, NewMerchant,
+    NewMerchantSettlement, NewPaymentIntent, PaymentIntent, PaymentIntentStatus, Receipt,
+    SettlementKind, SettlementStatus,
 };
 
 /// Map an enum-parse failure on a freshly-read row into a decode error
@@ -92,13 +94,12 @@ pub async fn update_merchant_status(
     id: &str,
     status: MerchantStatus,
 ) -> Result<bool, sqlx::Error> {
-    let res = sqlx::query(
-        "UPDATE zk402_merchants SET status = $2, updated_at = now() WHERE id = $1",
-    )
-    .bind(id)
-    .bind(status.as_str())
-    .execute(pool)
-    .await?;
+    let res =
+        sqlx::query("UPDATE zk402_merchants SET status = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(status.as_str())
+            .execute(pool)
+            .await?;
     Ok(res.rows_affected() == 1)
 }
 
@@ -264,9 +265,28 @@ pub async fn load_payment_intent_by_voucher(
     row.map(parse_payment_intent_row).transpose()
 }
 
-fn parse_payment_intent_row(
-    r: sqlx::postgres::PgRow,
-) -> Result<PaymentIntent, sqlx::Error> {
+/// Load a payment intent by id (the facilitator's bookkeeping key; the
+/// voucher lookup above is the buyer-facing idempotency read).
+pub async fn load_payment_intent(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Option<PaymentIntent>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id, voucher_id, authorization_id, payer, merchant_id, network, \
+                asset, amount_sats, fee_amount_sats, resource_hash, request_hash, \
+                nonce, valid_after, valid_before, canonical_message, \
+                signature_scheme, signature, status, failure_code, \
+                failure_message, access_threshold, publisher_acceptance_id, \
+                created_at, updated_at \
+         FROM zk402_payment_intents WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(parse_payment_intent_row).transpose()
+}
+
+fn parse_payment_intent_row(r: sqlx::postgres::PgRow) -> Result<PaymentIntent, sqlx::Error> {
     let status: String = r.try_get("status")?;
     let access_threshold: String = r.try_get("access_threshold")?;
     Ok(PaymentIntent {
@@ -416,30 +436,255 @@ pub async fn load_receipt_for_intent(
     .transpose()
 }
 
+// ---- batches ----------------------------------------------------------------
+
+/// Insert a batch. Idempotent on `id`; the amount totals, counters and
+/// milestone timestamps default at the database and are advanced later
+/// by the batch state machine.
+pub async fn insert_batch(pool: &PgPool, b: &NewBatch) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "INSERT INTO zk402_batches (id, network, merchant_id, status) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(&b.id)
+    .bind(&b.network)
+    .bind(b.merchant_id.as_deref())
+    .bind(b.status.as_str())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Load a batch by id.
+pub async fn load_batch(pool: &PgPool, id: &str) -> Result<Option<Batch>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id, network, merchant_id, status, gross_amount_sats, \
+                fee_amount_sats, net_amount_sats, intent_count, zkcoins_proof_id, \
+                commit_txid, reveal_txid, failure_code, failure_message, \
+                retry_count, created_at, updated_at \
+         FROM zk402_batches WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|r| {
+        let status: String = r.try_get("status")?;
+        Ok(Batch {
+            id: r.try_get("id")?,
+            network: r.try_get("network")?,
+            merchant_id: r.try_get("merchant_id")?,
+            status: status.parse::<BatchStatus>().map_err(decode_err)?,
+            gross_amount_sats: r.try_get("gross_amount_sats")?,
+            fee_amount_sats: r.try_get("fee_amount_sats")?,
+            net_amount_sats: r.try_get("net_amount_sats")?,
+            intent_count: r.try_get("intent_count")?,
+            zkcoins_proof_id: r.try_get("zkcoins_proof_id")?,
+            commit_txid: r.try_get("commit_txid")?,
+            reveal_txid: r.try_get("reveal_txid")?,
+            failure_code: r.try_get("failure_code")?,
+            failure_message: r.try_get("failure_message")?,
+            retry_count: r.try_get("retry_count")?,
+            created_at: r.try_get("created_at")?,
+            updated_at: r.try_get("updated_at")?,
+        })
+    })
+    .transpose()
+}
+
+/// Advance a batch's status.
+pub async fn update_batch_status(
+    pool: &PgPool,
+    id: &str,
+    status: BatchStatus,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("UPDATE zk402_batches SET status = $2, updated_at = now() WHERE id = $1")
+        .bind(id)
+        .bind(status.as_str())
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+// ---- batch items ------------------------------------------------------------
+
+/// Add an intent to a batch. Idempotent on the `(batch_id,
+/// payment_intent_id)` composite primary key — re-adding the same intent
+/// to the same batch is a no-op.
+pub async fn insert_batch_item(pool: &PgPool, item: &BatchItem) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "INSERT INTO zk402_batch_items \
+         (batch_id, payment_intent_id, amount_sats, fee_sats, net_sats) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (batch_id, payment_intent_id) DO NOTHING",
+    )
+    .bind(&item.batch_id)
+    .bind(&item.payment_intent_id)
+    .bind(item.amount_sats)
+    .bind(item.fee_sats)
+    .bind(item.net_sats)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// List the intents in a batch, ordered by intent id for a stable view.
+pub async fn list_batch_items(
+    pool: &PgPool,
+    batch_id: &str,
+) -> Result<Vec<BatchItem>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT batch_id, payment_intent_id, amount_sats, fee_sats, net_sats \
+         FROM zk402_batch_items WHERE batch_id = $1 ORDER BY payment_intent_id",
+    )
+    .bind(batch_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(BatchItem {
+                batch_id: r.try_get("batch_id")?,
+                payment_intent_id: r.try_get("payment_intent_id")?,
+                amount_sats: r.try_get("amount_sats")?,
+                fee_sats: r.try_get("fee_sats")?,
+                net_sats: r.try_get("net_sats")?,
+            })
+        })
+        .collect()
+}
+
+// ---- merchant settlements ---------------------------------------------------
+
+/// Append a settlement ledger entry. Idempotent on `id`; the ledger is
+/// append-only, so a derived merchant balance is a sum over these
+/// immutable rows — never a mutable custodial column.
+pub async fn insert_merchant_settlement(
+    pool: &PgPool,
+    s: &NewMerchantSettlement,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "INSERT INTO zk402_merchant_settlements \
+         (id, merchant_id, payment_intent_id, batch_id, kind, amount_sats, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(&s.id)
+    .bind(&s.merchant_id)
+    .bind(s.payment_intent_id.as_deref())
+    .bind(s.batch_id.as_deref())
+    .bind(s.kind.as_str())
+    .bind(s.amount_sats)
+    .bind(s.status.as_str())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// List a merchant's settlement ledger, oldest first.
+pub async fn list_merchant_settlements(
+    pool: &PgPool,
+    merchant_id: &str,
+) -> Result<Vec<MerchantSettlement>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, merchant_id, payment_intent_id, batch_id, kind, amount_sats, \
+                status, created_at \
+         FROM zk402_merchant_settlements WHERE merchant_id = $1 ORDER BY created_at, id",
+    )
+    .bind(merchant_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            let kind: String = r.try_get("kind")?;
+            let status: String = r.try_get("status")?;
+            Ok(MerchantSettlement {
+                id: r.try_get("id")?,
+                merchant_id: r.try_get("merchant_id")?,
+                payment_intent_id: r.try_get("payment_intent_id")?,
+                batch_id: r.try_get("batch_id")?,
+                kind: kind.parse::<SettlementKind>().map_err(decode_err)?,
+                amount_sats: r.try_get("amount_sats")?,
+                status: status.parse::<SettlementStatus>().map_err(decode_err)?,
+                created_at: r.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
 // ---- audit events -----------------------------------------------------------
 
-/// Append a ZK402 domain audit event. Mirrors `db::insert_request_log`:
-/// callers either await it (when the event must land before responding)
-/// or `tokio::spawn` it fire-and-forget, logging-and-dropping failures
-/// like `audit::persist_audit_entry` does.
-pub async fn insert_audit_event(pool: &PgPool, e: &AuditEvent) -> Result<(), sqlx::Error> {
-    sqlx::query(
+/// Build a [`NewAuditEvent`] without hand-typing the field names; the
+/// database stamps `id` and `created_at`.
+pub fn audit_event(
+    actor: impl Into<String>,
+    entity_type: impl Into<String>,
+    entity_id: impl Into<String>,
+    event_type: impl Into<String>,
+    event_json: serde_json::Value,
+) -> NewAuditEvent {
+    NewAuditEvent {
+        actor: actor.into(),
+        entity_type: entity_type.into(),
+        entity_id: entity_id.into(),
+        event_type: event_type.into(),
+        event_json,
+    }
+}
+
+/// Append a ZK402 domain audit event, returning the new `BIGSERIAL` id.
+/// Mirrors `db::insert_request_log`: callers either await it (when the
+/// event must land before responding) or `tokio::spawn` it
+/// fire-and-forget, logging-and-dropping failures like
+/// `audit::persist_audit_entry` does.
+pub async fn insert_audit_event(pool: &PgPool, e: &NewAuditEvent) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query(
         "INSERT INTO zk402_audit_events \
          (actor, entity_type, entity_id, event_type, event_json) \
-         VALUES ($1, $2, $3, $4, $5)",
+         VALUES ($1, $2, $3, $4, $5) RETURNING id",
     )
     .bind(&e.actor)
     .bind(&e.entity_type)
     .bind(&e.entity_id)
     .bind(&e.event_type)
     .bind(&e.event_json)
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
-    Ok(())
+    row.try_get("id")
 }
 
-/// Count audit events for an entity — used by tests and the (later)
+/// List audit events for an entity, oldest first — the (later)
 /// dashboard's per-entity audit view, keyed on the
+/// `zk402_audit_events_entity_idx` index.
+pub async fn list_audit_events_for_entity(
+    pool: &PgPool,
+    entity_type: &str,
+    entity_id: &str,
+) -> Result<Vec<AuditEvent>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, actor, entity_type, entity_id, event_type, event_json, created_at \
+         FROM zk402_audit_events \
+         WHERE entity_type = $1 AND entity_id = $2 ORDER BY created_at, id",
+    )
+    .bind(entity_type)
+    .bind(entity_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(AuditEvent {
+                id: r.try_get("id")?,
+                actor: r.try_get("actor")?,
+                entity_type: r.try_get("entity_type")?,
+                entity_id: r.try_get("entity_id")?,
+                event_type: r.try_get("event_type")?,
+                event_json: r.try_get("event_json")?,
+                created_at: r.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
+/// Count audit events for an entity — keyed on the
 /// `zk402_audit_events_entity_idx` index.
 pub async fn count_audit_events(
     pool: &PgPool,

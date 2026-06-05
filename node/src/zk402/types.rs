@@ -340,6 +340,17 @@ pub struct Batch {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Insert shape for a `zk402_batches` row. The amount totals,
+/// `intent_count`, `retry_count` and milestone timestamps all default at
+/// the database and are advanced later by the batch state machine.
+#[derive(Debug, Clone)]
+pub struct NewBatch {
+    pub id: String,
+    pub network: String,
+    pub merchant_id: Option<String>,
+    pub status: BatchStatus,
+}
+
 /// In-memory view of a `zk402_batch_items` row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatchItem {
@@ -364,12 +375,39 @@ pub struct MerchantSettlement {
     pub created_at: DateTime<Utc>,
 }
 
+/// Insert shape for a `zk402_merchant_settlements` row. `created_at` is
+/// stamped by the database; entries are immutable after `posted`.
+#[derive(Debug, Clone)]
+pub struct NewMerchantSettlement {
+    pub id: String,
+    pub merchant_id: String,
+    pub payment_intent_id: Option<String>,
+    pub batch_id: Option<String>,
+    pub kind: SettlementKind,
+    pub amount_sats: i64,
+    pub status: SettlementStatus,
+}
+
+/// In-memory view of a `zk402_audit_events` row (`id` is the
+/// `BIGSERIAL` the database assigned on insert).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditEvent {
+    pub id: i64,
+    pub actor: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub event_type: String,
+    pub event_json: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Insert shape for a `zk402_audit_events` row. Mirrors the
 /// `db::RequestLogEntry` pattern: plain owned fields, built by the
-/// caller, shipped to the insert helper (awaited when the event must
-/// land before responding, or `tokio::spawn`ed fire-and-forget).
+/// caller (or via [`super::store::audit_event`]), shipped to the insert
+/// helper (awaited when the event must land before responding, or
+/// `tokio::spawn`ed fire-and-forget).
 #[derive(Debug, Clone)]
-pub struct AuditEvent {
+pub struct NewAuditEvent {
     pub actor: String,
     pub entity_type: String,
     pub entity_id: String,

@@ -16,9 +16,9 @@ use crate::test_db::setup_pool;
 
 use super::store;
 use super::types::{
-    AccessThreshold, AuditEvent, AuthorizationStatus, BatchStatus, MerchantStatus,
-    NewAuthorization, NewMerchant, NewPaymentIntent, PaymentIntentStatus, SettlementKind,
-    SettlementStatus,
+    AccessThreshold, AuthorizationStatus, BatchItem, BatchStatus, MerchantStatus, NewAuthorization,
+    NewBatch, NewMerchant, NewMerchantSettlement, NewPaymentIntent, PaymentIntentStatus,
+    SettlementKind, SettlementStatus,
 };
 
 fn new_merchant(id: &str) -> NewMerchant {
@@ -97,7 +97,10 @@ async fn merchant_create_read_roundtrip() {
         .unwrap();
     assert!(inserted);
 
-    let loaded = store::load_merchant(pool, "merchant-1").await.unwrap().unwrap();
+    let loaded = store::load_merchant(pool, "merchant-1")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.id, "merchant-1");
     assert_eq!(loaded.display_name, "Test Merchant");
     assert_eq!(loaded.status, MerchantStatus::Active);
@@ -111,14 +114,22 @@ async fn merchant_create_read_roundtrip() {
     assert!(!replayed);
 
     // Status update round-trips.
-    assert!(store::update_merchant_status(pool, "merchant-1", MerchantStatus::Disabled)
+    assert!(
+        store::update_merchant_status(pool, "merchant-1", MerchantStatus::Disabled)
+            .await
+            .unwrap()
+    );
+    let disabled = store::load_merchant(pool, "merchant-1")
         .await
-        .unwrap());
-    let disabled = store::load_merchant(pool, "merchant-1").await.unwrap().unwrap();
+        .unwrap()
+        .unwrap();
     assert_eq!(disabled.status, MerchantStatus::Disabled);
 
     // Missing merchant reads as None.
-    assert!(store::load_merchant(pool, "missing").await.unwrap().is_none());
+    assert!(store::load_merchant(pool, "missing")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -131,7 +142,10 @@ async fn authorization_create_read_roundtrip() {
         .unwrap();
     assert!(inserted);
 
-    let loaded = store::load_authorization(pool, "auth-1").await.unwrap().unwrap();
+    let loaded = store::load_authorization(pool, "auth-1")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.id, "auth-1");
     assert_eq!(loaded.status, AuthorizationStatus::Pending);
     assert_eq!(loaded.authorized_amount_sats, 100_000);
@@ -141,9 +155,11 @@ async fn authorization_create_read_roundtrip() {
     assert_eq!(loaded.spend_limit_per_request_sats, Some(1_000));
 
     // Idempotent replay.
-    assert!(!store::insert_authorization(pool, &new_authorization("auth-1"))
-        .await
-        .unwrap());
+    assert!(
+        !store::insert_authorization(pool, &new_authorization("auth-1"))
+            .await
+            .unwrap()
+    );
 
     // Revocation transition round-trips.
     assert!(
@@ -151,7 +167,10 @@ async fn authorization_create_read_roundtrip() {
             .await
             .unwrap()
     );
-    let revoked = store::load_authorization(pool, "auth-1").await.unwrap().unwrap();
+    let revoked = store::load_authorization(pool, "auth-1")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(revoked.status, AuthorizationStatus::Revoked);
 }
 
@@ -159,20 +178,24 @@ async fn authorization_create_read_roundtrip() {
 async fn duplicate_voucher_id_rejected() {
     let scope = setup_pool().await;
     let pool = &scope.pool;
-    store::insert_merchant(pool, &new_merchant("merchant-1")).await.unwrap();
+    store::insert_merchant(pool, &new_merchant("merchant-1"))
+        .await
+        .unwrap();
 
-    assert!(
-        store::insert_payment_intent(pool, &new_intent("pi-1", "voucher-1", "nonce-1", "merchant-1"))
-            .await
-            .unwrap()
-    );
+    assert!(store::insert_payment_intent(
+        pool,
+        &new_intent("pi-1", "voucher-1", "nonce-1", "merchant-1")
+    )
+    .await
+    .unwrap());
 
     // Same id ⇒ idempotent no-op.
-    assert!(
-        !store::insert_payment_intent(pool, &new_intent("pi-1", "voucher-1", "nonce-1", "merchant-1"))
-            .await
-            .unwrap()
-    );
+    assert!(!store::insert_payment_intent(
+        pool,
+        &new_intent("pi-1", "voucher-1", "nonce-1", "merchant-1")
+    )
+    .await
+    .unwrap());
 
     // Different id, same voucher_id ⇒ unique violation (replay backstop).
     let err = store::insert_payment_intent(
@@ -192,11 +215,16 @@ async fn duplicate_voucher_id_rejected() {
 async fn duplicate_nonce_rejected() {
     let scope = setup_pool().await;
     let pool = &scope.pool;
-    store::insert_merchant(pool, &new_merchant("merchant-1")).await.unwrap();
-
-    store::insert_payment_intent(pool, &new_intent("pi-1", "voucher-1", "nonce-1", "merchant-1"))
+    store::insert_merchant(pool, &new_merchant("merchant-1"))
         .await
         .unwrap();
+
+    store::insert_payment_intent(
+        pool,
+        &new_intent("pi-1", "voucher-1", "nonce-1", "merchant-1"),
+    )
+    .await
+    .unwrap();
 
     let err = store::insert_payment_intent(
         pool,
@@ -215,10 +243,15 @@ async fn duplicate_nonce_rejected() {
 async fn payment_intent_status_milestones() {
     let scope = setup_pool().await;
     let pool = &scope.pool;
-    store::insert_merchant(pool, &new_merchant("merchant-1")).await.unwrap();
-    store::insert_payment_intent(pool, &new_intent("pi-1", "voucher-1", "nonce-1", "merchant-1"))
+    store::insert_merchant(pool, &new_merchant("merchant-1"))
         .await
         .unwrap();
+    store::insert_payment_intent(
+        pool,
+        &new_intent("pi-1", "voucher-1", "nonce-1", "merchant-1"),
+    )
+    .await
+    .unwrap();
 
     let now = Utc::now();
     assert!(
@@ -262,10 +295,15 @@ async fn payment_intent_status_milestones() {
 async fn receipt_is_unique_per_intent() {
     let scope = setup_pool().await;
     let pool = &scope.pool;
-    store::insert_merchant(pool, &new_merchant("merchant-1")).await.unwrap();
-    store::insert_payment_intent(pool, &new_intent("pi-1", "voucher-1", "nonce-1", "merchant-1"))
+    store::insert_merchant(pool, &new_merchant("merchant-1"))
         .await
         .unwrap();
+    store::insert_payment_intent(
+        pool,
+        &new_intent("pi-1", "voucher-1", "nonce-1", "merchant-1"),
+    )
+    .await
+    .unwrap();
 
     let receipt_body = json!({"receiptId": "r-1", "settlementState": "queued"});
     assert!(
@@ -292,7 +330,10 @@ async fn receipt_is_unique_per_intent() {
         "expected the one-receipt-per-intent index to fire, got: {err}"
     );
 
-    let loaded = store::load_receipt_for_intent(pool, "pi-1").await.unwrap().unwrap();
+    let loaded = store::load_receipt_for_intent(pool, "pi-1")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.id, "r-1");
     assert_eq!(loaded.receipt_json, receipt_body);
 }
@@ -302,24 +343,187 @@ async fn audit_event_insert_works() {
     let scope = setup_pool().await;
     let pool = &scope.pool;
 
-    let event = AuditEvent {
-        actor: "facilitator".to_owned(),
-        entity_type: "payment_intent".to_owned(),
-        entity_id: "pi-1".to_owned(),
-        event_type: "verification_succeeded".to_owned(),
-        event_json: json!({"voucherId": "voucher-1", "network": "zkcoins:regtest"}),
-    };
-    store::insert_audit_event(pool, &event).await.unwrap();
-    store::insert_audit_event(pool, &event).await.unwrap(); // append-only: same event twice is two rows
+    let event = store::audit_event(
+        "facilitator",
+        "payment_intent",
+        "pi-1",
+        "verification_succeeded",
+        json!({"voucherId": "voucher-1", "network": "zkcoins:regtest"}),
+    );
+    let first_id = store::insert_audit_event(pool, &event).await.unwrap();
+    let second_id = store::insert_audit_event(pool, &event).await.unwrap(); // append-only: same event twice is two rows
+    assert!(second_id > first_id, "BIGSERIAL ids must be monotonic");
 
     assert_eq!(
-        store::count_audit_events(pool, "payment_intent", "pi-1").await.unwrap(),
+        store::count_audit_events(pool, "payment_intent", "pi-1")
+            .await
+            .unwrap(),
         2
     );
     assert_eq!(
-        store::count_audit_events(pool, "payment_intent", "other").await.unwrap(),
+        store::count_audit_events(pool, "payment_intent", "other")
+            .await
+            .unwrap(),
         0
     );
+
+    // Read-back lists both rows oldest-first with DB-stamped metadata.
+    let events = store::list_audit_events_for_entity(pool, "payment_intent", "pi-1")
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].id, first_id);
+    assert_eq!(events[1].id, second_id);
+    assert_eq!(events[0].actor, "facilitator");
+    assert_eq!(events[0].event_type, "verification_succeeded");
+    assert_eq!(events[0].event_json["voucherId"], "voucher-1");
+    assert!(
+        store::list_audit_events_for_entity(pool, "payment_intent", "other")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Batch + batch-item + settlement-ledger helpers round-trip, with the
+/// same idempotent-replay contract the payment writes carry.
+#[tokio::test]
+async fn batch_and_settlement_helpers_work() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+
+    store::insert_merchant(pool, &new_merchant("merchant-1"))
+        .await
+        .unwrap();
+    store::insert_payment_intent(
+        pool,
+        &new_intent("pi-1", "voucher-1", "nonce-1", "merchant-1"),
+    )
+    .await
+    .unwrap();
+
+    // Batch create/read/replay/status-update.
+    let batch = NewBatch {
+        id: "batch-1".to_owned(),
+        network: "zkcoins:regtest".to_owned(),
+        merchant_id: Some("merchant-1".to_owned()),
+        status: BatchStatus::Open,
+    };
+    assert!(store::insert_batch(pool, &batch).await.unwrap());
+    assert!(!store::insert_batch(pool, &batch).await.unwrap()); // idempotent replay
+
+    let loaded = store::load_batch(pool, "batch-1").await.unwrap().unwrap();
+    assert_eq!(loaded.status, BatchStatus::Open);
+    assert_eq!(loaded.gross_amount_sats, 0); // DB defaults
+    assert_eq!(loaded.intent_count, 0);
+    assert_eq!(loaded.retry_count, 0);
+    assert!(store::load_batch(pool, "missing").await.unwrap().is_none());
+
+    assert!(
+        store::update_batch_status(pool, "batch-1", BatchStatus::Locked)
+            .await
+            .unwrap()
+    );
+    let locked = store::load_batch(pool, "batch-1").await.unwrap().unwrap();
+    assert_eq!(locked.status, BatchStatus::Locked);
+
+    // Batch membership, idempotent on the composite PK.
+    let item = BatchItem {
+        batch_id: "batch-1".to_owned(),
+        payment_intent_id: "pi-1".to_owned(),
+        amount_sats: 500,
+        fee_sats: 5,
+        net_sats: 495,
+    };
+    assert!(store::insert_batch_item(pool, &item).await.unwrap());
+    assert!(!store::insert_batch_item(pool, &item).await.unwrap()); // replay
+
+    let items = store::list_batch_items(pool, "batch-1").await.unwrap();
+    assert_eq!(items, vec![item]);
+
+    // A batch item must reference an existing intent (FK).
+    let orphan = BatchItem {
+        payment_intent_id: "pi-missing".to_owned(),
+        ..items[0].clone()
+    };
+    let err = store::insert_batch_item(pool, &orphan).await.unwrap_err();
+    assert_eq!(
+        constraint_of(&err).as_deref(),
+        Some("zk402_batch_items_payment_intent_id_fkey")
+    );
+
+    // Settlement ledger: append-only entries, idempotent on id.
+    let entry = NewMerchantSettlement {
+        id: "settle-1".to_owned(),
+        merchant_id: "merchant-1".to_owned(),
+        payment_intent_id: Some("pi-1".to_owned()),
+        batch_id: Some("batch-1".to_owned()),
+        kind: SettlementKind::Accepted,
+        amount_sats: 495,
+        status: SettlementStatus::Pending,
+    };
+    assert!(store::insert_merchant_settlement(pool, &entry)
+        .await
+        .unwrap());
+    assert!(!store::insert_merchant_settlement(pool, &entry)
+        .await
+        .unwrap()); // replay
+
+    let fee = NewMerchantSettlement {
+        id: "settle-2".to_owned(),
+        payment_intent_id: None,
+        batch_id: None,
+        kind: SettlementKind::Fee,
+        amount_sats: -5,
+        status: SettlementStatus::Posted,
+        ..entry.clone()
+    };
+    assert!(store::insert_merchant_settlement(pool, &fee).await.unwrap());
+
+    let ledger = store::list_merchant_settlements(pool, "merchant-1")
+        .await
+        .unwrap();
+    assert_eq!(ledger.len(), 2);
+    assert_eq!(ledger[0].id, "settle-1");
+    assert_eq!(ledger[0].kind, SettlementKind::Accepted);
+    assert_eq!(ledger[0].status, SettlementStatus::Pending);
+    assert_eq!(ledger[1].id, "settle-2");
+    assert_eq!(ledger[1].kind, SettlementKind::Fee);
+    // The derived view is a sum over immutable entries.
+    assert_eq!(ledger.iter().map(|s| s.amount_sats).sum::<i64>(), 490);
+}
+
+/// Loading a payment intent works by id as well as by voucher, and both
+/// reads agree.
+#[tokio::test]
+async fn payment_intent_loads_by_id_and_voucher() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+
+    store::insert_merchant(pool, &new_merchant("merchant-1"))
+        .await
+        .unwrap();
+    store::insert_payment_intent(
+        pool,
+        &new_intent("pi-1", "voucher-1", "nonce-1", "merchant-1"),
+    )
+    .await
+    .unwrap();
+
+    let by_id = store::load_payment_intent(pool, "pi-1")
+        .await
+        .unwrap()
+        .unwrap();
+    let by_voucher = store::load_payment_intent_by_voucher(pool, "voucher-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_id, by_voucher);
+    assert_eq!(by_id.id, "pi-1");
+    assert!(store::load_payment_intent(pool, "missing")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// Non-custodial schema lint (hard rule from prompts/00-master-context.md):
@@ -388,7 +592,9 @@ fn enum_string_roundtrips() {
         assert_eq!(v.as_str().parse::<SettlementStatus>().unwrap(), *v);
     }
 
-    let err = "definitely_not_a_status".parse::<PaymentIntentStatus>().unwrap_err();
+    let err = "definitely_not_a_status"
+        .parse::<PaymentIntentStatus>()
+        .unwrap_err();
     assert_eq!(err.kind, "PaymentIntentStatus");
     assert_eq!(err.value, "definitely_not_a_status");
     assert!(err.to_string().contains("PaymentIntentStatus"));
@@ -402,10 +608,15 @@ fn enum_string_roundtrips() {
 async fn payment_intent_status_check_accepts_all_variants() {
     let scope = setup_pool().await;
     let pool = &scope.pool;
-    store::insert_merchant(pool, &new_merchant("merchant-1")).await.unwrap();
-    store::insert_payment_intent(pool, &new_intent("pi-1", "voucher-1", "nonce-1", "merchant-1"))
+    store::insert_merchant(pool, &new_merchant("merchant-1"))
         .await
         .unwrap();
+    store::insert_payment_intent(
+        pool,
+        &new_intent("pi-1", "voucher-1", "nonce-1", "merchant-1"),
+    )
+    .await
+    .unwrap();
 
     for status in PaymentIntentStatus::ALL {
         assert!(
