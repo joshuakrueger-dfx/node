@@ -1,0 +1,75 @@
+# ZK402 full local test environment.
+#
+#   docker compose --profile offline   up -d --build   # netless (default)
+#   docker compose --profile mutinynet up -d --build   # real testnet tip
+#
+# After up:  ./seed.sh   (onboard merchant + metering channel)
+#            ./e2e.sh    (full verify→settle→dashboard→meter smoke)
+#            open http://localhost:3402  (dashboard, login with seed key)
+name: zk402-local
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: zk402
+      POSTGRES_PASSWORD: zk402
+      POSTGRES_DB: zk402
+    ports: ["5432:5432"]
+    volumes: ["zk402-postgres:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zk402"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  esplora-stub:
+    build: ./esplora-stub
+    profiles: ["offline"]
+    ports: ["3002:3002"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3002/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Offline node → talks to the stub.
+  zkcoins-node:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    profiles: ["offline"]
+    env_file: [.env]
+    environment:
+      ESPLORA_URL: http://esplora-stub:3002
+      ESPLORA_WS_URL: ws://esplora-stub:3002/api/v1/ws
+    ports: ["4242:4242"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      esplora-stub: { condition: service_healthy }
+
+  # Mutinynet node → real public testnet endpoints.
+  zkcoins-node-mutinynet:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    profiles: ["mutinynet"]
+    env_file: [.env]
+    environment:
+      ESPLORA_URL: https://mutinynet.com/api
+      ESPLORA_WS_URL: wss://mutinynet.com/api/v1/ws
+    ports: ["4242:4242"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  dashboard:
+    build:
+      context: ../../../zk402-dashboard
+      dockerfile: Dockerfile
+    profiles: ["offline", "mutinynet"]
+    environment:
+      NEXT_PUBLIC_ZK402_API_URL: http://localhost:4242
+    ports: ["3402:3402"]
+
+volumes:
+  zk402-postgres:

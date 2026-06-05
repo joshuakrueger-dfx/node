@@ -1,0 +1,4 @@
+.env
+.seed/
+node_modules/
+esplora-stub/node_modules/
