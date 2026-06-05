@@ -50,6 +50,13 @@ pub mod scanner_ws;
 pub mod scanner_ws_parse;
 pub mod state;
 pub mod username;
+// ZK402 publisher payment layer (Step 1: DB & domain). The helpers are
+// exercised by the module's own test suite but are not yet called from a
+// production route (that lands in Step 3), so the module carries
+// `#[allow(dead_code)]` for now — the same posture `db` held during its
+// initial PR-A1.
+#[allow(dead_code)]
+pub mod zk402;
 
 use crate::publisher::EsploraConfig;
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};

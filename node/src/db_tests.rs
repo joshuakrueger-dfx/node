@@ -73,6 +73,9 @@ async fn connect_and_migrate_creates_all_tables() {
     //     filter — included at the correct alphabetic position below.)
     //   * After 0014 (jobs):             23 tables + 1 view (#161
     //     introduces the async Job-API state table.)
+    //   * After 0015 (zk402):            31 tables + 1 view (ZK402
+    //     publisher payment layer — Step 1 DB & domain; see
+    //     `node/src/zk402/`.)
     assert_eq!(
         names,
         vec![
@@ -100,6 +103,14 @@ async fn connect_and_migrate_creates_all_tables() {
             "tx_mining_log".to_string(),
             "username_claim_log".to_string(),
             "usernames".to_string(),
+            "zk402_audit_events".to_string(),
+            "zk402_authorizations".to_string(),
+            "zk402_batch_items".to_string(),
+            "zk402_batches".to_string(),
+            "zk402_merchant_settlements".to_string(),
+            "zk402_merchants".to_string(),
+            "zk402_payment_intents".to_string(),
+            "zk402_receipts".to_string(),
         ]
     );
 }
