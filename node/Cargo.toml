@@ -179,6 +179,15 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 # rather than through a transitive path that could shift on `cargo
 # update`.
 async-stream = "0.3"
+# ZK402 facilitator receipts are Ed25519-signed (specs/receipt-signatures.md),
+# deliberately separate from the Bitcoin/zkCoins secp256k1 keys. `ring`
+# is already in the dependency graph (rustls/tls) and ships a vetted,
+# deterministic Ed25519 implementation; declared directly so the zk402
+# receipt module can sign/verify without a second crypto stack. `base64`
+# (0.22) provides the URL-safe-no-padding encoding the receipt + nonce
+# wire forms require; also already transitively present.
+ring = "0.17"
+base64 = "0.22"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

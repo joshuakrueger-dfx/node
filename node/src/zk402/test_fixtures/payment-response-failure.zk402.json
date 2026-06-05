@@ -1,0 +1,17 @@
+{
+  "header": "PAYMENT-RESPONSE",
+  "base64": "eyJzdWNjZXNzIjpmYWxzZSwiZXJyb3JSZWFzb24iOiJwdWJsaXNoZXJfYWNjZXB0YW5jZV9mYWlsZWQiLCJwYXllciI6InprcGF5ZXJfZjkzMDhhMDE5MjU4YzMxMDQ5MzQ0Zjg1Zjg5ZDUyMjliNTMxYzg0NTgzNmY5OWIwODYwMWYxMTNiY2UwMzZmOSIsInRyYW5zYWN0aW9uIjoiIiwibmV0d29yayI6InprY29pbnM6bXV0aW55bmV0IiwiYW1vdW50IjoiMjUiLCJleHRlbnNpb25zIjp7InprNDAyIjp7ImludmFsaWRNZXNzYWdlIjoiemtDb2lucyBwdWJsaXNoZXIgY291bGQgbm90IGFjY2VwdCB0aGUgc2lnbmVkIGludGVudCJ9fX0=",
+  "decoded": {
+    "success": false,
+    "errorReason": "publisher_acceptance_failed",
+    "payer": "zkpayer_f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+    "transaction": "",
+    "network": "zkcoins:mutinynet",
+    "amount": "25",
+    "extensions": {
+      "zk402": {
+        "invalidMessage": "zkCoins publisher could not accept the signed intent"
+      }
+    }
+  }
+}

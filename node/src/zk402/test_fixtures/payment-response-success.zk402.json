@@ -1,0 +1,22 @@
+{
+  "header": "PAYMENT-RESPONSE",
+  "base64": "eyJzdWNjZXNzIjp0cnVlLCJ0cmFuc2FjdGlvbiI6Inprcl8wMUowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsIm5ldHdvcmsiOiJ6a2NvaW5zOm11dGlueW5ldCIsInBheWVyIjoiemtwYXllcl9mOTMwOGEwMTkyNThjMzEwNDkzNDRmODVmODlkNTIyOWI1MzFjODQ1ODM2Zjk5YjA4NjAxZjExM2JjZTAzNmY5IiwiYW1vdW50IjoiMjUiLCJleHRlbnNpb25zIjp7InprNDAyIjp7InJlY2VpcHRJZCI6Inprcl8wMUowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsInN0YXR1cyI6InB1Ymxpc2hlcl9hY2NlcHRlZCIsInNldHRsZW1lbnRTdGF0ZSI6InF1ZXVlZCIsImFjY2Vzc1RocmVzaG9sZCI6InB1Ymxpc2hlcl9hY2NlcHRlZCIsInZvdWNoZXJJZCI6Inprdl8wMUowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCIsImZhY2lsaXRhdG9yU2lnbmF0dXJlIjoiZml4dHVyZS1lZDI1NTE5LXNpZ25hdHVyZS1iYXNlNjR1cmwiLCJraWQiOiJyZWNlaXB0LWtleS0wMDEifX19",
+  "decoded": {
+    "success": true,
+    "transaction": "zkr_01J00000000000000000000000",
+    "network": "zkcoins:mutinynet",
+    "payer": "zkpayer_f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+    "amount": "25",
+    "extensions": {
+      "zk402": {
+        "receiptId": "zkr_01J00000000000000000000000",
+        "status": "publisher_accepted",
+        "settlementState": "queued",
+        "accessThreshold": "publisher_accepted",
+        "voucherId": "zkv_01J00000000000000000000000",
+        "facilitatorSignature": "fixture-ed25519-signature-base64url",
+        "kid": "receipt-key-001"
+      }
+    }
+  }
+}

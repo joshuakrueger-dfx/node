@@ -2998,7 +2998,30 @@ pub(crate) fn create_router(state: AppState) -> Router {
     // headers and all. The `from_fn_with_state` adapter clones the
     // state for every request (state itself is `Arc`-backed, so the
     // clone is cheap).
+    // ZK402 facilitator sub-router (`/v2/x402/verify` + `/settle`).
+    // Self-contained state (pool + receipt signer + publisher hook) so
+    // the facilitator stays isolated from the wallet/job surface; see
+    // `zk402::routes`. The signer loads from `ZK402_RECEIPT_KEY`
+    // (base64url PKCS8) when set, otherwise generates an ephemeral
+    // testnet key at boot — receipts then don't survive a restart,
+    // which is acceptable until Step 10 wires real key management.
+    let zk402_signer = match std::env::var("ZK402_RECEIPT_KEY") {
+        Ok(b64) => {
+            crate::zk402::receipt::ReceiptSigner::from_pkcs8_base64url(&b64, "receipt-key-001")
+                .expect("ZK402_RECEIPT_KEY must be valid base64url PKCS8 Ed25519")
+        }
+        Err(_) => crate::zk402::receipt::ReceiptSigner::generate("receipt-key-001")
+            .expect("Ed25519 keygen cannot fail"),
+    };
+    let zk402_router =
+        crate::zk402::routes::create_zk402_router(crate::zk402::routes::Zk402State {
+            pool: state.pool.clone(),
+            signer: std::sync::Arc::new(zk402_signer),
+            publisher: std::sync::Arc::new(crate::zk402::facilitator::MockPublisherAccept),
+        });
+
     app.with_state(state.clone())
+        .merge(zk402_router)
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(cors)
         .layer(axum::middleware::from_fn_with_state(

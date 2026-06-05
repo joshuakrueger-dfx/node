@@ -1,0 +1,33 @@
+{
+  "algorithm": "Ed25519",
+  "kid": "receipt-key-001",
+  "publicKeySpkiDerBase64url": "MCowBQYDK2VwAyEAyd4xnuI0aSS49k1TlrnTkXIU5ssSDccE0WEuNHcScNA",
+  "privateKeyPkcs8DerBase64urlForFixtureOnly": "MC4CAQAwBQYDK2VwBCIEIF-eB8rmNHYUxrOWTXCmmBm4o2AqZ744cmkBUxcLesv2",
+  "canonicalWithoutSignature": "{\"accessThreshold\":\"publisher_accepted\",\"amount\":\"25\",\"asset\":\"btc-sats\",\"createdAt\":\"2026-05-28T00:00:00Z\",\"expiresAt\":\"2026-05-28T00:01:00Z\",\"feeAmount\":\"1\",\"intentId\":\"zkintent_01J00000000000000000000000\",\"kid\":\"receipt-key-001\",\"merchant\":\"merchant_01J00000000000000000000000\",\"mode\":\"exact-payment-intent\",\"network\":\"zkcoins:mutinynet\",\"payer\":\"zkpayer_f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\",\"receiptId\":\"zkr_01J00000000000000000000000\",\"requestHash\":\"sha256:761b8d5a72948c73c0e2b703309d7603045f436c8317139f743de0fd6623e282\",\"resourceHash\":\"sha256:4f7d0c0000000000000000000000000000000000000000000000000000000000000\",\"scheme\":\"zkcoins-publisher\",\"settlementState\":\"queued\",\"signatureAlgorithm\":\"Ed25519\",\"status\":\"publisher_accepted\",\"voucherId\":\"zkv_01J00000000000000000000000\",\"x402Version\":2}",
+  "signatureBase64url": "zgxvSCX9eU-exjIRqAZ44UBgofjBDgonxO5vCbBTnVtMZGmVF1BNht9hSA8XexOrWycF0K-ViggvCVtJ-hqiCQ",
+  "receipt": {
+    "receiptId": "zkr_01J00000000000000000000000",
+    "x402Version": 2,
+    "scheme": "zkcoins-publisher",
+    "network": "zkcoins:mutinynet",
+    "mode": "exact-payment-intent",
+    "status": "publisher_accepted",
+    "settlementState": "queued",
+    "accessThreshold": "publisher_accepted",
+    "payer": "zkpayer_f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+    "merchant": "merchant_01J00000000000000000000000",
+    "amount": "25",
+    "feeAmount": "1",
+    "asset": "btc-sats",
+    "resourceHash": "sha256:4f7d0c0000000000000000000000000000000000000000000000000000000000000",
+    "requestHash": "sha256:761b8d5a72948c73c0e2b703309d7603045f436c8317139f743de0fd6623e282",
+    "voucherId": "zkv_01J00000000000000000000000",
+    "intentId": "zkintent_01J00000000000000000000000",
+    "authorizationId": null,
+    "createdAt": "2026-05-28T00:00:00Z",
+    "expiresAt": "2026-05-28T00:01:00Z",
+    "kid": "receipt-key-001",
+    "signatureAlgorithm": "Ed25519",
+    "signature": "zgxvSCX9eU-exjIRqAZ44UBgofjBDgonxO5vCbBTnVtMZGmVF1BNht9hSA8XexOrWycF0K-ViggvCVtJ-hqiCQ"
+  }
+}
