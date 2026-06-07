@@ -256,6 +256,28 @@ async fn discovery_search_filters_text_network_and_price() {
 }
 
 #[tokio::test]
+async fn search_with_like_metacharacters_does_not_500() {
+    // A query of LIKE metachars (incl. a lone trailing backslash) must be
+    // escaped, not break the public search into a 503.
+    let (app, _scope) = env().await;
+    post_json(
+        &app,
+        "/api/zk402/services",
+        Some("zk402_sk_one"),
+        service_body("ocr", 3),
+    )
+    .await;
+    for q in ["%25", "_", "%5C", "a%5Cb", "ocr%25"] {
+        let (status, body) =
+            get_json(&app, &format!("/v2/x402/discovery/search?query={q}"), None).await;
+        assert_eq!(status, StatusCode::OK, "query {q} → {status}: {body}");
+        // Wildcard query must not match everything: a bare `%` escaped is a
+        // literal percent, so it finds no service named with a percent.
+        assert!(body["resources"].is_array());
+    }
+}
+
+#[tokio::test]
 async fn supported_adverts_testnets_never_mainnet() {
     let (app, _scope) = env().await;
     let (status, body) = get_json(&app, "/v2/x402/supported", None).await;

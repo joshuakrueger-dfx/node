@@ -39,6 +39,13 @@ fn sha256_tagged(bytes: &[u8]) -> String {
 
 /// Deterministic id for a price policy (binds the policy into the
 /// resource hash so a changed price yields a new resource identity).
+///
+/// NODE-INTERNAL derivation: buyers never recompute this — discovery
+/// serves the finished `resource_hash` and the voucher binds it verbatim,
+/// so cross-language interop does not depend on this canonicalization.
+/// If an SDK ever needs to derive the same id independently, pin a shared
+/// fixture first (the key ordering / number formatting here is Rust
+/// `serde_json`, not RFC 8785).
 fn price_policy_id(policy: &Value) -> String {
     // Compact, key-sorted JSON for stability.
     let canonical = canonical_json(policy);
@@ -66,8 +73,11 @@ fn canonical_json(v: &Value) -> String {
     }
 }
 
-/// The `ZK402-RESOURCE-V1` resource hash for a service, identical to the
-/// SDK's `resourceHash(merchantId, resourceId, pricePolicyId)`.
+/// The `ZK402-RESOURCE-V1` resource hash for a service. The outer string
+/// construction is byte-identical to the SDK's
+/// `resourceHash(merchantId, resourceId, pricePolicyId)` (pinned by
+/// `resource_hash_matches_sdk_construction`); the `price_policy_id`
+/// input itself is node-derived — see [`price_policy_id`].
 pub fn resource_hash(merchant_id: &str, resource_id: &str, price_policy_id: &str) -> String {
     let s = format!(
         "ZK402-RESOURCE-V1\nmerchant_id={merchant_id}\nresource_id={resource_id}\nprice_policy_id={price_policy_id}"

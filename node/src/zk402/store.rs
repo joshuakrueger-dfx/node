@@ -1015,7 +1015,15 @@ pub async fn search_active_services(
     max_price_sats: Option<i64>,
     limit: i64,
 ) -> Result<Vec<Service>, sqlx::Error> {
-    let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+    // Escape the LIKE metacharacters. The backslash MUST be escaped first,
+    // otherwise a query like `\` produces a pattern ending in a lone escape
+    // (`%\%`) which Postgres rejects with "LIKE pattern must not end with
+    // escape character" — turning a one-char public query into a 503.
+    let escaped = query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%{escaped}%");
     let rows = sqlx::query(&format!(
         "SELECT {SERVICE_COLUMNS} FROM zk402_services \
          WHERE status = 'active' \
