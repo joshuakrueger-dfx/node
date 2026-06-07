@@ -105,6 +105,11 @@ fn settled_in_list() -> String {
 /// discovery page): signals grouped by `resource_hash`. Hashes with no
 /// payment history are simply absent (callers default to
 /// `ReputationSignals::default()`).
+///
+/// Latency is clamped to `>= 0`: `publisher_accepted_at` is stamped from
+/// the handler's second-truncated clock while `created_at` is the DB's
+/// microsecond `now()`, so a sub-second settle can read fractionally
+/// negative — clamp instead of reporting nonsense to ranking agents.
 pub async fn signals_for_resources(
     pool: &PgPool,
     resource_hashes: &[String],
@@ -124,7 +129,7 @@ pub async fn signals_for_resources(
                 AND created_at > now() - interval '30 days'), 0)::bigint \
                 AS volume_30d_sats, \
             percentile_cont(0.5) WITHIN GROUP (ORDER BY \
-                EXTRACT(EPOCH FROM (publisher_accepted_at - created_at)) * 1000.0) \
+                GREATEST(0, EXTRACT(EPOCH FROM (publisher_accepted_at - created_at)) * 1000.0)) \
                 FILTER (WHERE publisher_accepted_at IS NOT NULL) \
                 AS median_settle_latency_ms, \
             MIN(publisher_accepted_at) AS first_settled_at \

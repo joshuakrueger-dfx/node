@@ -157,6 +157,12 @@ async fn aggregates_derive_from_payment_history() {
         rep.success_rate
     );
     assert!(rep.signals.first_settled_at.is_some());
+    // Latency must never be negative (clock-granularity clamp): the
+    // handler stamps publisher_accepted_at at second precision while
+    // created_at is the DB's microsecond now().
+    if let Some(ms) = rep.signals.median_settle_latency_ms {
+        assert!(ms >= 0.0, "negative latency leaked: {ms}");
+    }
 }
 
 #[tokio::test]
