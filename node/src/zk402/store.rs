@@ -18,10 +18,10 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use super::types::{
-    AuditEvent, Authorization, AuthorizationStatus, Batch, BatchItem, BatchStatus, Merchant,
-    MerchantSettlement, MerchantStatus, NewAuditEvent, NewAuthorization, NewBatch, NewMerchant,
-    NewMerchantSettlement, NewPaymentIntent, PaymentIntent, PaymentIntentStatus, Receipt,
-    SettlementKind, SettlementStatus,
+    AccessThreshold, AuditEvent, Authorization, AuthorizationStatus, Batch, BatchItem, BatchStatus,
+    Merchant, MerchantSettlement, MerchantStatus, NewAuditEvent, NewAuthorization, NewBatch,
+    NewMerchant, NewMerchantSettlement, NewPaymentIntent, NewService, PaymentIntent,
+    PaymentIntentStatus, Receipt, Service, ServiceStatus, SettlementKind, SettlementStatus,
 };
 
 /// Map an enum-parse failure on a freshly-read row into a decode error
@@ -874,4 +874,177 @@ pub async fn list_usage_events(
             })
         })
         .collect()
+}
+
+// ---- services (Agent Economy, Layer 1) -------------------------------------
+
+fn service_from_row(r: &sqlx::postgres::PgRow) -> Result<Service, sqlx::Error> {
+    let access_threshold: String = r.try_get("access_threshold")?;
+    let status: String = r.try_get("status")?;
+    Ok(Service {
+        id: r.try_get("id")?,
+        merchant_id: r.try_get("merchant_id")?,
+        capability: r.try_get("capability")?,
+        display_name: r.try_get("display_name")?,
+        description: r.try_get("description")?,
+        endpoint: r.try_get("endpoint")?,
+        input_schema: r.try_get("input_schema")?,
+        output_schema: r.try_get("output_schema")?,
+        network: r.try_get("network")?,
+        asset: r.try_get("asset")?,
+        price_policy_json: r.try_get("price_policy_json")?,
+        headline_amount_sats: r.try_get("headline_amount_sats")?,
+        access_threshold: access_threshold
+            .parse::<AccessThreshold>()
+            .map_err(decode_err)?,
+        resource_hash: r.try_get("resource_hash")?,
+        facilitator: r.try_get("facilitator")?,
+        privacy_level: r.try_get("privacy_level")?,
+        status: status.parse::<ServiceStatus>().map_err(decode_err)?,
+        created_at: r.try_get("created_at")?,
+        updated_at: r.try_get("updated_at")?,
+    })
+}
+
+const SERVICE_COLUMNS: &str = "id, merchant_id, capability, display_name, description, \
+     endpoint, input_schema, output_schema, network, asset, price_policy_json, \
+     headline_amount_sats, access_threshold, resource_hash, facilitator, \
+     privacy_level, status, created_at, updated_at";
+
+/// Insert a service. Idempotent on `id` (`ON CONFLICT DO NOTHING`);
+/// returns `true` when the row was inserted.
+pub async fn insert_service(pool: &PgPool, s: &NewService) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "INSERT INTO zk402_services \
+         (id, merchant_id, capability, display_name, description, endpoint, \
+          input_schema, output_schema, network, asset, price_policy_json, \
+          headline_amount_sats, access_threshold, resource_hash, facilitator, \
+          privacy_level, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(&s.id)
+    .bind(&s.merchant_id)
+    .bind(&s.capability)
+    .bind(&s.display_name)
+    .bind(s.description.as_deref())
+    .bind(&s.endpoint)
+    .bind(s.input_schema.as_deref())
+    .bind(s.output_schema.as_deref())
+    .bind(&s.network)
+    .bind(&s.asset)
+    .bind(&s.price_policy_json)
+    .bind(s.headline_amount_sats)
+    .bind(s.access_threshold.as_str())
+    .bind(&s.resource_hash)
+    .bind(&s.facilitator)
+    .bind(&s.privacy_level)
+    .bind(s.status.as_str())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Load a service by id.
+pub async fn load_service(pool: &PgPool, id: &str) -> Result<Option<Service>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        "SELECT {SERVICE_COLUMNS} FROM zk402_services WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|r| service_from_row(&r)).transpose()
+}
+
+/// Update a service's status (`active` ↔ `disabled`). Scoped to the
+/// owning merchant — a merchant can never flip another merchant's row.
+pub async fn update_service_status(
+    pool: &PgPool,
+    id: &str,
+    merchant_id: &str,
+    status: ServiceStatus,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE zk402_services SET status = $3, updated_at = now() \
+         WHERE id = $1 AND merchant_id = $2",
+    )
+    .bind(id)
+    .bind(merchant_id)
+    .bind(status.as_str())
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Paginated active-service catalog (discovery `resources`), newest
+/// first. Returns the page plus the total active count for the
+/// pagination envelope.
+pub async fn list_active_services(
+    pool: &PgPool,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<Service>, i64), sqlx::Error> {
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM zk402_services WHERE status = 'active'")
+            .fetch_one(pool)
+            .await?;
+    let rows = sqlx::query(&format!(
+        "SELECT {SERVICE_COLUMNS} FROM zk402_services WHERE status = 'active' \
+         ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2"
+    ))
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+    let services = rows
+        .iter()
+        .map(service_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((services, total))
+}
+
+/// Text search over the active catalog (discovery `search`):
+/// case-insensitive substring match on capability, name, and
+/// description, with optional exact filters. `max_price_sats` caps the
+/// headline amount. Plain `ILIKE` — the v1 ranking is recency; semantic
+/// ranking arrives with the reputation read model.
+pub async fn search_active_services(
+    pool: &PgPool,
+    query: &str,
+    network: Option<&str>,
+    max_price_sats: Option<i64>,
+    limit: i64,
+) -> Result<Vec<Service>, sqlx::Error> {
+    let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+    let rows = sqlx::query(&format!(
+        "SELECT {SERVICE_COLUMNS} FROM zk402_services \
+         WHERE status = 'active' \
+           AND (capability ILIKE $1 OR display_name ILIKE $1 \
+                OR COALESCE(description, '') ILIKE $1) \
+           AND ($2::text IS NULL OR network = $2) \
+           AND ($3::bigint IS NULL OR headline_amount_sats <= $3) \
+         ORDER BY created_at DESC, id DESC LIMIT $4"
+    ))
+    .bind(&pattern)
+    .bind(network)
+    .bind(max_price_sats)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(service_from_row).collect()
+}
+
+/// A merchant's own catalog (dashboard view), any status.
+pub async fn list_services_for_merchant(
+    pool: &PgPool,
+    merchant_id: &str,
+) -> Result<Vec<Service>, sqlx::Error> {
+    let rows = sqlx::query(&format!(
+        "SELECT {SERVICE_COLUMNS} FROM zk402_services WHERE merchant_id = $1 \
+         ORDER BY created_at DESC, id DESC"
+    ))
+    .bind(merchant_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(service_from_row).collect()
 }

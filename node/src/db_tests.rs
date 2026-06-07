@@ -114,6 +114,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "zk402_merchants".to_string(),
             "zk402_payment_intents".to_string(),
             "zk402_receipts".to_string(),
+            "zk402_services".to_string(),
             "zk402_usage_events".to_string(),
         ]
     );

@@ -17,8 +17,8 @@ use serde_json::Value;
 use super::canonical::VoucherFields;
 use super::error::Zk402Error;
 
-const SCHEME: &str = "zkcoins-publisher";
-const ASSET: &str = "btc-sats";
+pub const SCHEME: &str = "zkcoins-publisher";
+pub const ASSET: &str = "btc-sats";
 const SIGNATURE_SCHEME: &str = "bip340-schnorr";
 
 /// Networks ZK402 accepts. Testnet only — `zkcoins:mainnet` is

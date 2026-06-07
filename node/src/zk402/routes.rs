@@ -87,6 +87,23 @@ pub fn create_zk402_router(state: Zk402State) -> Router {
         )
         // ZK402-Stream (Flow-D) metering — the LLM-token billing hot path.
         .route("/v2/x402/stream/meter", post(stream_meter_handler))
+        // Agent Economy Layer 1: x402 v2 capability advert + Bazaar
+        // discovery (read-only, public — discovery is meant to be
+        // crawled) and merchant-scoped service registration.
+        .route("/v2/x402/supported", axum::routing::get(supported_handler))
+        .route(
+            "/v2/x402/discovery/resources",
+            axum::routing::get(discovery_resources_handler),
+        )
+        .route(
+            "/v2/x402/discovery/search",
+            axum::routing::get(discovery_search_handler),
+        )
+        .route("/api/zk402/services", post(register_service_handler))
+        .route(
+            "/api/zk402/dashboard/services",
+            axum::routing::get(dashboard_services_handler),
+        )
         .with_state(state)
 }
 
@@ -660,6 +677,233 @@ async fn get_receipt_handler(
     match super::store::load_receipt_json(&s.pool, &id).await {
         Ok(Some(v)) => (StatusCode::OK, Json(v)),
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" }))),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "unavailable" })),
+        ),
+    }
+}
+
+// ---- Agent Economy Layer 1: discovery + service registration ----------------
+
+/// `GET /v2/x402/supported` — advertise the scheme(s) + (testnet)
+/// networks this facilitator settles, x402 `/supported` shape.
+async fn supported_handler(State(_s): State<Zk402State>) -> Json<Value> {
+    let kinds: Vec<Value> = super::payload::SUPPORTED_NETWORKS
+        .iter()
+        .map(|n| json!({ "scheme": super::payload::SCHEME, "network": n }))
+        .collect();
+    Json(json!({ "x402Version": 2, "kinds": kinds }))
+}
+
+#[derive(serde::Deserialize)]
+struct ResourcesQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// `GET /v2/x402/discovery/resources` — paginated catalog of active
+/// services in the x402 Bazaar wire format.
+async fn discovery_resources_handler(
+    State(s): State<Zk402State>,
+    Query(q): Query<ResourcesQuery>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0).max(0);
+    match super::store::list_active_services(&s.pool, limit, offset).await {
+        Ok((services, total)) => {
+            let items: Vec<Value> = services
+                .iter()
+                .map(super::services::discovery_item)
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "x402Version": 2,
+                    "items": items,
+                    "pagination": { "limit": limit, "offset": offset, "total": total },
+                })),
+            )
+        }
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "unavailable" })),
+        ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SearchQuery {
+    query: Option<String>,
+    network: Option<String>,
+    #[serde(rename = "maxPriceSats")]
+    max_price_sats: Option<i64>,
+    limit: Option<i64>,
+}
+
+/// `GET /v2/x402/discovery/search` — text search over the active catalog
+/// in the x402 Bazaar search shape. v1 ranking is recency; reputation
+/// ranking lands with the read model (Layer 4).
+async fn discovery_search_handler(
+    State(s): State<Zk402State>,
+    Query(q): Query<SearchQuery>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    let query = q.query.unwrap_or_default();
+    let limit = q.limit.unwrap_or(20).clamp(1, 20);
+    match super::store::search_active_services(
+        &s.pool,
+        &query,
+        q.network.as_deref(),
+        q.max_price_sats,
+        limit,
+    )
+    .await
+    {
+        Ok(services) => {
+            let resources: Vec<Value> = services
+                .iter()
+                .map(super::services::discovery_item)
+                .collect();
+            let partial = resources.len() as i64 >= limit;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "x402Version": 2,
+                    "resources": resources,
+                    "partialResults": partial,
+                    "searchMethod": "text",
+                })),
+            )
+        }
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "unavailable" })),
+        ),
+    }
+}
+
+/// `POST /api/zk402/services` — register a service for the authenticated
+/// merchant (API key). The merchant id comes from the key, never the
+/// body; the resource hash is derived, never trusted.
+async fn register_service_handler(
+    State(s): State<Zk402State>,
+    headers: HeaderMap,
+    Json(req): Json<Value>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    let merchant = match authed_merchant(&s, &headers).await {
+        Ok(m) => m,
+        Err((code, body)) => return (StatusCode::from_u16(code).unwrap(), body),
+    };
+
+    let get = |k: &str| req.get(k).and_then(Value::as_str).map(str::to_owned);
+    let (capability, display_name, endpoint, network, facilitator) = match (
+        get("capability"),
+        get("displayName"),
+        get("endpoint"),
+        get("network"),
+        get("facilitator"),
+    ) {
+        (Some(c), Some(d), Some(e), Some(n), Some(f)) => (c, d, e, n, f),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_payload",
+                    "message": "capability, displayName, endpoint, network, facilitator are required" })),
+            )
+        }
+    };
+
+    let price_policy = req.get("pricePolicy").cloned().unwrap_or_else(|| json!({}));
+    // Headline price: explicit field, else the policy's amountSats.
+    let headline = req
+        .get("headlineAmountSats")
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .or_else(|| {
+            price_policy.get("amountSats").and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+        })
+        .unwrap_or(0);
+
+    let access_threshold = match req
+        .get("accessThreshold")
+        .and_then(Value::as_str)
+        .unwrap_or("publisher_accepted")
+        .parse::<super::types::AccessThreshold>()
+    {
+        Ok(a) => a,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_payload", "message": "invalid accessThreshold" })),
+            )
+        }
+    };
+
+    let service_id =
+        get("serviceId").unwrap_or_else(|| format!("svc_{}", uuid::Uuid::new_v4().simple()));
+    let privacy_level = get("privacyLevel").unwrap_or_else(|| "private".to_owned());
+
+    let input = super::services::NewServiceInput {
+        service_id,
+        merchant_id: merchant,
+        capability,
+        display_name,
+        description: get("description"),
+        endpoint,
+        input_schema: get("inputSchema"),
+        output_schema: get("outputSchema"),
+        network,
+        price_policy,
+        headline_amount_sats: headline,
+        access_threshold,
+        facilitator,
+        privacy_level,
+    };
+
+    match super::services::register_service(&s.pool, input).await {
+        Ok(svc) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "serviceId": svc.id,
+                "merchantId": svc.merchant_id,
+                "resourceHash": svc.resource_hash,
+                "resource": super::services::discovery_item(&svc),
+            })),
+        ),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.code() }))),
+    }
+}
+
+/// `GET /api/zk402/dashboard/services` — the authenticated merchant's own
+/// catalog (any status).
+async fn dashboard_services_handler(
+    State(s): State<Zk402State>,
+    headers: HeaderMap,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    let merchant = match authed_merchant(&s, &headers).await {
+        Ok(m) => m,
+        Err((code, body)) => return (StatusCode::from_u16(code).unwrap(), body),
+    };
+    match super::store::list_services_for_merchant(&s.pool, &merchant).await {
+        Ok(services) => {
+            let items: Vec<Value> = services
+                .iter()
+                .map(super::services::discovery_item)
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({ "merchantId": merchant, "services": items })),
+            )
+        }
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "error": "unavailable" })),

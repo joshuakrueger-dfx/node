@@ -40,6 +40,7 @@ pub mod hardening;
 pub mod payload;
 pub mod receipt;
 pub mod routes;
+pub mod services;
 pub mod settlement;
 pub mod signature;
 pub mod store;
@@ -58,6 +59,8 @@ mod facilitator_tests;
 mod hardening_tests;
 #[cfg(test)]
 mod routes_extra_tests;
+#[cfg(test)]
+mod services_tests;
 #[cfg(test)]
 mod settlement_tests;
 #[cfg(test)]

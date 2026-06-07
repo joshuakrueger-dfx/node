@@ -414,3 +414,62 @@ pub struct NewAuditEvent {
     pub event_type: String,
     pub event_json: serde_json::Value,
 }
+
+zk402_str_enum! {
+    /// `zk402_services.status` (Agent Economy, Layer 1).
+    ServiceStatus {
+        Active => "active",
+        Disabled => "disabled",
+    }
+}
+
+/// In-memory view of a `zk402_services` row — a merchant's discoverable
+/// offering (proposals/AGENT_ECONOMY_design.md, Layer 1). Owned by a
+/// merchant; carries NO balance. `headline_amount_sats` is the figure
+/// surfaced in the discovery `accepts` block (the per-request price, or
+/// the per-unit price for metered policies); the full policy lives in
+/// `price_policy_json`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Service {
+    pub id: String,
+    pub merchant_id: String,
+    pub capability: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub endpoint: String,
+    pub input_schema: Option<String>,
+    pub output_schema: Option<String>,
+    pub network: String,
+    pub asset: String,
+    pub price_policy_json: serde_json::Value,
+    pub headline_amount_sats: i64,
+    pub access_threshold: AccessThreshold,
+    pub resource_hash: String,
+    pub facilitator: String,
+    pub privacy_level: String,
+    pub status: ServiceStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Insert shape for a `zk402_services` row (DB fills the timestamps).
+#[derive(Debug, Clone)]
+pub struct NewService {
+    pub id: String,
+    pub merchant_id: String,
+    pub capability: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub endpoint: String,
+    pub input_schema: Option<String>,
+    pub output_schema: Option<String>,
+    pub network: String,
+    pub asset: String,
+    pub price_policy_json: serde_json::Value,
+    pub headline_amount_sats: i64,
+    pub access_threshold: AccessThreshold,
+    pub resource_hash: String,
+    pub facilitator: String,
+    pub privacy_level: String,
+    pub status: ServiceStatus,
+}
