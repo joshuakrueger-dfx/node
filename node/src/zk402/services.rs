@@ -181,6 +181,13 @@ pub fn requirement_block(s: &Service) -> Value {
 /// wire format. `metadata` carries the Bazaar input/output schema plus our
 /// capability + privacy advert (and, later, the reputation snapshot).
 pub fn discovery_item(s: &Service) -> Value {
+    discovery_item_with_reputation(s, None)
+}
+
+/// Discovery item enriched with the (derived, read-only) seller
+/// reputation snapshot in `metadata.reputation` — what a discovering
+/// agent ranks on (Layer 4). `None` omits the field.
+pub fn discovery_item_with_reputation(s: &Service, reputation: Option<Value>) -> Value {
     json!({
         "resource": s.endpoint,
         "type": "http",
@@ -196,6 +203,7 @@ pub fn discovery_item(s: &Service) -> Value {
             "pricePolicy": s.price_policy_json,
             "privacyLevel": s.privacy_level,
             "serviceId": s.id,
+            "reputation": reputation,
         },
     })
 }

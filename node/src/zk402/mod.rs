@@ -39,6 +39,7 @@ pub mod facilitator;
 pub mod hardening;
 pub mod payload;
 pub mod receipt;
+pub mod reputation;
 pub mod routes;
 pub mod services;
 pub mod settlement;
@@ -57,6 +58,8 @@ mod dashboard_tests;
 mod facilitator_tests;
 #[cfg(test)]
 mod hardening_tests;
+#[cfg(test)]
+mod reputation_tests;
 #[cfg(test)]
 mod routes_extra_tests;
 #[cfg(test)]

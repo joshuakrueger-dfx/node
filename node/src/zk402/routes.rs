@@ -101,6 +101,10 @@ pub fn create_zk402_router(state: Zk402State) -> Router {
         )
         .route("/api/zk402/services", post(register_service_handler))
         .route(
+            "/api/zk402/services/:id/reputation",
+            axum::routing::get(service_reputation_handler),
+        )
+        .route(
             "/api/zk402/dashboard/services",
             axum::routing::get(dashboard_services_handler),
         )
@@ -696,6 +700,37 @@ async fn supported_handler(State(_s): State<Zk402State>) -> Json<Value> {
     Json(json!({ "x402Version": 2, "kinds": kinds }))
 }
 
+/// Build discovery items for a batch of services, each enriched with its
+/// derived reputation (one aggregate query, no N+1). Returns
+/// `(item_json, score)` so callers can rank. Services with no payment
+/// history get the neutral default reputation.
+async fn items_with_reputation(
+    s: &Zk402State,
+    services: &[super::types::Service],
+) -> Vec<(Value, i64)> {
+    let hashes: Vec<String> = services
+        .iter()
+        .map(|svc| svc.resource_hash.clone())
+        .collect();
+    let signals = super::reputation::signals_for_resources(&s.pool, &hashes)
+        .await
+        .unwrap_or_default();
+    let now = chrono::Utc::now();
+    services
+        .iter()
+        .map(|svc| {
+            let rep = super::reputation::from_signals(
+                signals.get(&svc.resource_hash).cloned().unwrap_or_default(),
+            );
+            let item = super::services::discovery_item_with_reputation(
+                svc,
+                Some(super::reputation::reputation_json(&rep, now)),
+            );
+            (item, rep.score)
+        })
+        .collect()
+}
+
 #[derive(serde::Deserialize)]
 struct ResourcesQuery {
     limit: Option<i64>,
@@ -703,7 +738,8 @@ struct ResourcesQuery {
 }
 
 /// `GET /v2/x402/discovery/resources` — paginated catalog of active
-/// services in the x402 Bazaar wire format.
+/// services in the x402 Bazaar wire format, each carrying its derived
+/// reputation in `metadata.reputation`.
 async fn discovery_resources_handler(
     State(s): State<Zk402State>,
     Query(q): Query<ResourcesQuery>,
@@ -713,9 +749,10 @@ async fn discovery_resources_handler(
     let offset = q.offset.unwrap_or(0).max(0);
     match super::store::list_active_services(&s.pool, limit, offset).await {
         Ok((services, total)) => {
-            let items: Vec<Value> = services
-                .iter()
-                .map(super::services::discovery_item)
+            let items: Vec<Value> = items_with_reputation(&s, &services)
+                .await
+                .into_iter()
+                .map(|(item, _)| item)
                 .collect();
             (
                 StatusCode::OK,
@@ -743,8 +780,9 @@ struct SearchQuery {
 }
 
 /// `GET /v2/x402/discovery/search` — text search over the active catalog
-/// in the x402 Bazaar search shape. v1 ranking is recency; reputation
-/// ranking lands with the read model (Layer 4).
+/// in the x402 Bazaar search shape, **ranked by reputation** (score
+/// descending; recency breaks ties via the store's ordering). This is the
+/// "cheapest provider with score > N" lever agents rank on.
 async fn discovery_search_handler(
     State(s): State<Zk402State>,
     Query(q): Query<SearchQuery>,
@@ -762,21 +800,57 @@ async fn discovery_search_handler(
     .await
     {
         Ok(services) => {
-            let resources: Vec<Value> = services
-                .iter()
-                .map(super::services::discovery_item)
-                .collect();
-            let partial = resources.len() as i64 >= limit;
+            let count = services.len() as i64;
+            let mut ranked = items_with_reputation(&s, &services).await;
+            // Stable sort by score desc; equal scores keep store order
+            // (recency), so the result is deterministic.
+            ranked.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+            let resources: Vec<Value> = ranked.into_iter().map(|(item, _)| item).collect();
             (
                 StatusCode::OK,
                 Json(json!({
                     "x402Version": 2,
                     "resources": resources,
-                    "partialResults": partial,
+                    "partialResults": count >= limit,
                     "searchMethod": "text",
                 })),
             )
         }
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "unavailable" })),
+        ),
+    }
+}
+
+/// `GET /api/zk402/services/:id/reputation` — the derived, read-only
+/// reputation snapshot for one service (public; recomputable from signed
+/// payment history, never a stored score).
+async fn service_reputation_handler(
+    State(s): State<Zk402State>,
+    Path(id): Path<String>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    let svc = match super::store::load_service(&s.pool, &id).await {
+        Ok(Some(svc)) => svc,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" }))),
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "unavailable" })),
+            )
+        }
+    };
+    match super::reputation::for_resource(&s.pool, &svc.resource_hash).await {
+        Ok(rep) => (
+            StatusCode::OK,
+            Json(json!({
+                "serviceId": svc.id,
+                "merchantId": svc.merchant_id,
+                "capability": svc.capability,
+                "reputation": super::reputation::reputation_json(&rep, chrono::Utc::now()),
+            })),
+        ),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "error": "unavailable" })),
