@@ -604,3 +604,32 @@ async fn reorg_below_inclusion_height_leaves_intent_untouched() {
         PaymentIntentStatus::Confirmed
     );
 }
+
+#[tokio::test]
+async fn advance_is_a_noop_when_not_strictly_forward() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    seed_merchant_and_intent(pool, "m1", "pi1", 100).await;
+    sqlx::query("UPDATE zk402_payment_intents SET receiving_address = 'addr_pi1' WHERE id = 'pi1'")
+        .execute(pool)
+        .await
+        .unwrap();
+    let now = Utc::now().timestamp();
+    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(100), now)
+        .await
+        .unwrap();
+    // tip 100 → 1 conf → confirmed.
+    assert_eq!(
+        advance_intent_settlement(pool, "pi1", 100, now)
+            .await
+            .unwrap(),
+        Some(PaymentIntentStatus::Confirmed)
+    );
+    // Same tip again: target (confirmed) is not strictly past current → no-op.
+    assert_eq!(
+        advance_intent_settlement(pool, "pi1", 100, now)
+            .await
+            .unwrap(),
+        None
+    );
+}
