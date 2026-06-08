@@ -40,28 +40,45 @@ async fn score_is_neutral_without_history() {
 }
 
 #[tokio::test]
-async fn score_rewards_clean_volume_and_punishes_failures() {
-    let clean_small = reputation::score(&ReputationSignals {
+async fn score_rewards_payer_diversity_and_punishes_failures() {
+    // Confidence is driven by DISTINCT PAYERS, not raw settle volume.
+    let small = reputation::score(&ReputationSignals {
         settled_count: 5,
+        distinct_payers: 5,
         ..Default::default()
     })
     .0;
-    let clean_big = reputation::score(&ReputationSignals {
+    let big = reputation::score(&ReputationSignals {
         settled_count: 50,
+        distinct_payers: 50,
         ..Default::default()
     })
     .0;
-    // More clean volume ⇒ higher confidence ⇒ higher score, toward 100.
-    assert!(clean_big > clean_small, "{clean_big} !> {clean_small}");
-    assert!(clean_big >= 99, "50 clean settles saturates: {clean_big}");
+    assert!(big > small, "{big} !> {small}");
+    assert!(big >= 99, "20+ distinct payers saturates confidence: {big}");
     assert!(
-        clean_small > 50,
-        "any clean history beats neutral: {clean_small}"
+        small > 50,
+        "any clean diverse history beats neutral: {small}"
     );
+
+    // THE ANTI-WASH PROPERTY: 50 clean settles from ONE payer cannot buy a
+    // high score — one distinct counterparty caps confidence, so the score
+    // tops out at ~61 regardless of self-payment volume, well under the
+    // "score > 90" bar agents filter on.
+    let wash = reputation::score(&ReputationSignals {
+        settled_count: 50,
+        distinct_payers: 1,
+        ..Default::default()
+    })
+    .0;
+    assert!(wash < 65, "single-payer wash farm must stay low: {wash}");
+    assert!(wash < 90, "wash farm must not clear the score>90 filter: {wash}");
+    assert!(wash < big, "wash {wash} must not reach diverse {big}");
 
     // Failures pull the rate down hard.
     let with_failures = reputation::score(&ReputationSignals {
         settled_count: 50,
+        distinct_payers: 50,
         failed_count: 50,
         ..Default::default()
     });
@@ -70,11 +87,12 @@ async fn score_rewards_clean_volume_and_punishes_failures() {
         "50/50 success rate: {}",
         with_failures.1
     );
-    assert!(with_failures.0 < clean_big);
+    assert!(with_failures.0 < big);
 
     // Reversals count against the rate the same way.
     let with_reversal = reputation::score(&ReputationSignals {
         settled_count: 9,
+        distinct_payers: 9,
         reversed_count: 1,
         ..Default::default()
     });
@@ -84,12 +102,22 @@ async fn score_rewards_clean_volume_and_punishes_failures() {
 // ---- DB-derived aggregates --------------------------------------------------
 
 fn intent(id: &str, rhash: &str, amount: i64, status: PaymentIntentStatus) -> NewPaymentIntent {
+    intent_p(id, rhash, amount, status, "zkpayer_aa")
+}
+
+fn intent_p(
+    id: &str,
+    rhash: &str,
+    amount: i64,
+    status: PaymentIntentStatus,
+    payer: &str,
+) -> NewPaymentIntent {
     let now = Utc::now();
     NewPaymentIntent {
         id: id.to_owned(),
         voucher_id: format!("v_{id}"),
         authorization_id: None,
-        payer: "zkpayer_aa".to_owned(),
+        payer: payer.to_owned(),
         merchant_id: "merchant_1".to_owned(),
         network: "zkcoins:regtest".to_owned(),
         asset: "btc-sats".to_owned(),
@@ -157,12 +185,75 @@ async fn aggregates_derive_from_payment_history() {
         rep.success_rate
     );
     assert!(rep.signals.first_settled_at.is_some());
+    // finalized_count = published + final (2), distinct from accepted (3).
+    assert_eq!(rep.signals.finalized_count, 2, "published + final");
+    // All seeded settles share one payer → 1 distinct payer.
+    assert_eq!(rep.signals.distinct_payers, 1);
     // Latency must never be negative (clock-granularity clamp): the
     // handler stamps publisher_accepted_at at second precision while
     // created_at is the DB's microsecond now().
     if let Some(ms) = rep.signals.median_settle_latency_ms {
         assert!(ms >= 0.0, "negative latency leaked: {ms}");
     }
+}
+
+#[tokio::test]
+async fn distinct_payer_confidence_resists_wash_farming() {
+    let scope = setup_pool().await;
+    onboard_merchant(&scope.pool, "merchant_1", "M", "addr", "zk402_sk_one")
+        .await
+        .unwrap();
+    // WASH service: 30 clean settles, all from ONE payer.
+    let wash = "sha256:wash_service";
+    for i in 0..30 {
+        store::insert_payment_intent(
+            &scope.pool,
+            &intent_p(&format!("w{i}"), wash, 10, S::Final, "zkpayer_solo"),
+        )
+        .await
+        .unwrap();
+    }
+    // DIVERSE service: 25 clean settles, each from a DISTINCT payer.
+    let diverse = "sha256:diverse_service";
+    for i in 0..25 {
+        store::insert_payment_intent(
+            &scope.pool,
+            &intent_p(
+                &format!("d{i}"),
+                diverse,
+                10,
+                S::Final,
+                &format!("zkpayer_{i:03}"),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    let wash_rep = reputation::for_resource(&scope.pool, wash).await.unwrap();
+    let diverse_rep = reputation::for_resource(&scope.pool, diverse)
+        .await
+        .unwrap();
+    assert_eq!(wash_rep.signals.distinct_payers, 1);
+    assert_eq!(diverse_rep.signals.distinct_payers, 25);
+    // Both have a perfect (1.0) success rate and similar volume, yet the
+    // wash farm scores far lower — diversity is the moat, not volume.
+    assert!(
+        wash_rep.score < 65,
+        "30 self-payments must not buy a high score: {}",
+        wash_rep.score
+    );
+    assert!(
+        wash_rep.score < 90,
+        "wash farm must not clear the score>90 filter: {}",
+        wash_rep.score
+    );
+    assert!(
+        diverse_rep.score >= 95,
+        "25 distinct payers earns near-full confidence: {}",
+        diverse_rep.score
+    );
+    assert!(diverse_rep.score > wash_rep.score + 30);
 }
 
 #[tokio::test]

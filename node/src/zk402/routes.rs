@@ -779,6 +779,12 @@ struct SearchQuery {
     limit: Option<i64>,
 }
 
+/// How many recency-ordered candidates to pull from the store before
+/// ranking by reputation. Ranking only the first `limit` rows would let a
+/// newer low-score service hide an older high-score one — defeating the
+/// "score > N" contract — so we rank over a wider pool, then trim.
+const SEARCH_RANK_POOL: i64 = 200;
+
 /// `GET /v2/x402/discovery/search` — text search over the active catalog
 /// in the x402 Bazaar search shape, **ranked by reputation** (score
 /// descending; recency breaks ties via the store's ordering). This is the
@@ -790,28 +796,37 @@ async fn discovery_search_handler(
     use axum::http::StatusCode;
     let query = q.query.unwrap_or_default();
     let limit = q.limit.unwrap_or(20).clamp(1, 20);
+    // Fetch a wide recency pool, rank the whole pool by score, then trim to
+    // the requested limit — so reputation ranking is global, not windowed.
     match super::store::search_active_services(
         &s.pool,
         &query,
         q.network.as_deref(),
         q.max_price_sats,
-        limit,
+        SEARCH_RANK_POOL,
     )
     .await
     {
         Ok(services) => {
-            let count = services.len() as i64;
+            // `partialResults` is honest: true only if the candidate pool
+            // itself was capped (there may be matches we did not rank).
+            let pool_capped = services.len() as i64 >= SEARCH_RANK_POOL;
             let mut ranked = items_with_reputation(&s, &services).await;
             // Stable sort by score desc; equal scores keep store order
             // (recency), so the result is deterministic.
             ranked.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
-            let resources: Vec<Value> = ranked.into_iter().map(|(item, _)| item).collect();
+            let trimmed = ranked.len() as i64 > limit;
+            let resources: Vec<Value> = ranked
+                .into_iter()
+                .take(limit as usize)
+                .map(|(item, _)| item)
+                .collect();
             (
                 StatusCode::OK,
                 Json(json!({
                     "x402Version": 2,
                     "resources": resources,
-                    "partialResults": count >= limit,
+                    "partialResults": pool_capped || trimmed,
                     "searchMethod": "text",
                 })),
             )

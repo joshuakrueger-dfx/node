@@ -2941,7 +2941,15 @@ pub(crate) fn create_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::CONTENT_TYPE]);
+        // `x-api-key` / `authorization` carry the ZK402 dashboard bearer
+        // key; without them a browser dashboard on another origin/port
+        // (e.g. the local test environment on :3402 calling :4242) fails
+        // CORS preflight on every authenticated read.
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            header::HeaderName::from_static("x-api-key"),
+        ]);
 
     // MVP routes — always compiled in.
     let app = Router::new()
