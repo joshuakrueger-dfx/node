@@ -14,8 +14,9 @@ use super::batch::{retry_failed_batch, run_batch_cycle, BatchPolicy};
 use super::error::Zk402Error;
 use super::settlement::{
     advance_intent_settlement, confirm_batch, confirmations, finalize_batch,
-    record_receive_observation, resume_pending_batches, settle_batch, settlement_state_for,
-    BroadcastFailing, MockSettlement, ProverFailing, UnfundedPublisher, FINALITY_CONFIRMATIONS,
+    record_receive_observation, resume_pending_batches, reverse_intent, revert_reorged_intents,
+    settle_batch, settlement_state_for, BroadcastFailing, MockSettlement, ProverFailing,
+    UnfundedPublisher, FINALITY_CONFIRMATIONS,
 };
 use super::store;
 use super::types::{
@@ -429,5 +430,177 @@ async fn watch_advances_only_address_bound_intents() {
             .unwrap()
             .status,
         PaymentIntentStatus::Received
+    );
+}
+
+// --- Reversal / refund (Phase 1) ---------------------------------------------
+
+async fn seed_final_intent(pool: &sqlx::PgPool, mid: &str, iid: &str, amount: i64) {
+    seed_merchant_and_intent(pool, mid, iid, amount).await;
+    let addr = format!("addr_{iid}");
+    sqlx::query("UPDATE zk402_payment_intents SET receiving_address = $2 WHERE id = $1")
+        .bind(iid)
+        .bind(&addr)
+        .execute(pool)
+        .await
+        .unwrap();
+    let now = Utc::now().timestamp();
+    record_receive_observation(pool, Some(iid), &addr, amount, Some(100), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        advance_intent_settlement(pool, iid, 105, now)
+            .await
+            .unwrap(),
+        Some(PaymentIntentStatus::Final)
+    );
+}
+
+#[tokio::test]
+async fn reverse_intent_posts_single_reversal_and_is_idempotent() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    seed_final_intent(pool, "m1", "pi1", 100).await;
+    let now = Utc::now().timestamp();
+
+    assert!(reverse_intent(pool, "pi1", now).await.unwrap());
+    assert_eq!(
+        store::load_payment_intent(pool, "pi1")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PaymentIntentStatus::Reversed
+    );
+    let ledger = store::list_merchant_settlements(pool, "m1").await.unwrap();
+    let reversals: Vec<_> = ledger
+        .iter()
+        .filter(|s| s.kind == SettlementKind::Reversal)
+        .collect();
+    assert_eq!(reversals.len(), 1);
+    assert_eq!(reversals[0].amount_sats, 100);
+    // The original final credit is still present (append-only ledger).
+    assert_eq!(
+        ledger
+            .iter()
+            .filter(|s| s.kind == SettlementKind::Final)
+            .count(),
+        1
+    );
+
+    // Idempotent: re-reversing an already-reversed intent is a no-op.
+    assert!(!reverse_intent(pool, "pi1", now).await.unwrap());
+    let ledger2 = store::list_merchant_settlements(pool, "m1").await.unwrap();
+    assert_eq!(
+        ledger2
+            .iter()
+            .filter(|s| s.kind == SettlementKind::Reversal)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn reverse_intent_rejects_uncredited_and_unknown() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    seed_merchant_and_intent(pool, "m1", "pi1", 100).await; // status Received, never credited
+    let now = Utc::now().timestamp();
+    assert!(!reverse_intent(pool, "pi1", now).await.unwrap());
+    assert!(!reverse_intent(pool, "nope", now).await.unwrap());
+    let ledger = store::list_merchant_settlements(pool, "m1").await.unwrap();
+    assert!(ledger.iter().all(|s| s.kind != SettlementKind::Reversal));
+}
+
+// --- Reorg revert (Phase 1, Spec §3.7) ---------------------------------------
+
+#[tokio::test]
+async fn reorg_reverts_confirmed_intent_then_re_applies_under_new_chain() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    seed_merchant_and_intent(pool, "m1", "pi1", 100).await;
+    sqlx::query("UPDATE zk402_payment_intents SET receiving_address = 'addr_pi1' WHERE id = 'pi1'")
+        .execute(pool)
+        .await
+        .unwrap();
+    let now = Utc::now().timestamp();
+
+    // Anchored at block 102, tip 104 → 3 confs → confirmed.
+    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(102), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        advance_intent_settlement(pool, "pi1", 104, now)
+            .await
+            .unwrap(),
+        Some(PaymentIntentStatus::Confirmed)
+    );
+
+    // Reorg orphans every block >= 101 (including the inclusion block 102).
+    assert_eq!(revert_reorged_intents(pool, 101, now).await.unwrap(), 1);
+    assert_eq!(
+        store::load_payment_intent(pool, "pi1")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PaymentIntentStatus::Reorged
+    );
+    // Orphaned observation dropped → advance is fail-closed until re-observed.
+    assert_eq!(
+        advance_intent_settlement(pool, "pi1", 200, now)
+            .await
+            .unwrap(),
+        None
+    );
+
+    // The new canonical chain re-includes the transfer at block 150.
+    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(150), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        advance_intent_settlement(pool, "pi1", 156, now)
+            .await
+            .unwrap(),
+        Some(PaymentIntentStatus::Final)
+    );
+    let ledger = store::list_merchant_settlements(pool, "m1").await.unwrap();
+    assert_eq!(
+        ledger
+            .iter()
+            .filter(|s| s.kind == SettlementKind::Final)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn reorg_below_inclusion_height_leaves_intent_untouched() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    seed_merchant_and_intent(pool, "m1", "pi1", 100).await;
+    sqlx::query("UPDATE zk402_payment_intents SET receiving_address = 'addr_pi1' WHERE id = 'pi1'")
+        .execute(pool)
+        .await
+        .unwrap();
+    let now = Utc::now().timestamp();
+    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(100), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        advance_intent_settlement(pool, "pi1", 102, now)
+            .await
+            .unwrap(),
+        Some(PaymentIntentStatus::Confirmed)
+    );
+    // Reorg only orphans blocks >= 150 — the inclusion block 100 is untouched.
+    assert_eq!(revert_reorged_intents(pool, 150, now).await.unwrap(), 0);
+    assert_eq!(
+        store::load_payment_intent(pool, "pi1")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PaymentIntentStatus::Confirmed
     );
 }

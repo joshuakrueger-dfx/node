@@ -462,3 +462,104 @@ pub async fn advance_intent_settlement(
     }
     Ok(Some(target))
 }
+
+// ===========================================================================
+// Reversal / refund (chargeback, dispute, operator refund).
+//
+// A credited intent can be reversed: it moves to `reversed`, a single
+// append-only `reversal` ledger entry offsets the original credit, and
+// reputation's reversed_count (which counts intents with status='reversed',
+// reputation.rs) reflects it. Non-custodial: the ledger records the reversal
+// as a fact; no balance is mutated. Idempotent via the deterministic id.
+// ===========================================================================
+
+/// Reverse/refund a credited intent. Only an intent that was actually credited
+/// (`publisher_accepted`..`final`) can be reversed; already-terminal intents
+/// (reversed/failed/expired/reorged) are left untouched (`Ok(false)`).
+/// Re-running on an already-reversed intent is a no-op — no double reversal.
+pub async fn reverse_intent(pool: &PgPool, intent_id: &str, now: i64) -> Result<bool, Zk402Error> {
+    let row: Option<(String, i64, String)> = sqlx::query_as(
+        "SELECT merchant_id, amount_sats, status FROM zk402_payment_intents WHERE id = $1",
+    )
+    .bind(intent_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    let (merchant, amount, status) = match row {
+        Some(r) => r,
+        None => return Ok(false),
+    };
+    if !matches!(
+        status.as_str(),
+        "publisher_accepted" | "published" | "confirmed" | "final"
+    ) {
+        return Ok(false); // not in a reversible state
+    }
+
+    store::update_payment_intent_status(pool, intent_id, PaymentIntentStatus::Reversed, ts(now))
+        .await
+        .map_err(db_err)?;
+    // Single, idempotent reversal entry (offsets the original credit).
+    sqlx::query(
+        "INSERT INTO zk402_merchant_settlements \
+         (id, merchant_id, payment_intent_id, batch_id, kind, amount_sats, status) \
+         VALUES ($1, $2, $3, NULL, 'reversal', $4, 'posted') \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(format!("stl_reversal_{intent_id}"))
+    .bind(&merchant)
+    .bind(intent_id)
+    .bind(amount)
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(true)
+}
+
+// ===========================================================================
+// Reorg revert (chain reorganisation, Spec §3.7).
+//
+// When Bitcoin reorganises and orphans the blocks an intent's settlement was
+// anchored to, the prior confirmations are no longer valid. Affected
+// receive-correlated intents move to `reorged` and their orphaned observations
+// are dropped, so a fresh observation under the new canonical chain re-drives
+// them via `advance_intent_settlement` (which treats `reorged` as non-terminal,
+// rank 0, so it re-progresses published -> confirmed -> final). `final` intents
+// are assumed reorg-stable (§3.9 fixes finality at 6 confirmations and assumes
+// no reorg deeper than 5 blocks; a deeper reorg is a protocol-failure event,
+// not a recoverable transition), so only `published`/`confirmed` revert.
+// ===========================================================================
+
+/// Revert every receive-correlated intent whose settlement was anchored at or
+/// above `orphaned_from_height` (the lowest height the reorg orphaned). Such
+/// intents move to `reorged` and the orphaned observations are dropped.
+/// Returns the number of intents reverted. Re-applying happens automatically
+/// once a fresh observation lands under the new canonical chain.
+pub async fn revert_reorged_intents(
+    pool: &PgPool,
+    orphaned_from_height: i64,
+    now: i64,
+) -> Result<u64, Zk402Error> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT pi.id FROM zk402_payment_intents pi \
+         JOIN zk402_settlement_observations o ON o.receiving_address = pi.receiving_address \
+         WHERE pi.status IN ('published','confirmed') AND o.block_height >= $1",
+    )
+    .bind(orphaned_from_height)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+    for id in &ids {
+        store::update_payment_intent_status(pool, id, PaymentIntentStatus::Reorged, ts(now))
+            .await
+            .map_err(db_err)?;
+    }
+    // Drop observations anchored at/above the orphaned height — they reference
+    // blocks no longer in the canonical chain; the new chain re-emits fresh ones.
+    sqlx::query("DELETE FROM zk402_settlement_observations WHERE block_height >= $1")
+        .bind(orphaned_from_height)
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+    Ok(ids.len() as u64)
+}
