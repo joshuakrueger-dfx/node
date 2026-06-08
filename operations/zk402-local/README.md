@@ -16,11 +16,30 @@ docker compose --profile offline up -d --build
 # OR against real Mutinynet (public testnet tip/scanner):
 # docker compose --profile mutinynet up -d --build
 
-./seed.sh     # onboard merchant_demo (+ API key → .seed/), create a metering channel
+./seed.sh     # onboard merchant_demo (+ API key → .seed/), metering channel,
+              # AND seed the Bazaar: 3 demo sellers + service catalog + reputation
 ./e2e.sh      # full smoke: verify → settle → idempotent → dashboard → meter
 
 open http://localhost:3402     # dashboard — log in with the key in .seed/api-key
 ```
+
+## The Bazaar (agent economy)
+
+`seed.sh` calls `seed-bazaar.mjs`, which onboards **three demo sellers** and
+registers a curated catalog so the marketplace ranks meaningfully:
+
+| Seller | Services |
+|---|---|
+| `merchant_demo` | Claude Sonnet / Opus / Haiku inference (per request) |
+| `merchant_dataco` | Weather API, Crypto Price Feed, Web Search |
+| `merchant_gpufarm` | GPU Job (A100/min, `final` access), OCR |
+
+Reputation is **earned, not set**: the seeder settles exact payments from
+many *distinct* payers per service (distinct payers drive the confidence
+score), so `GET /v2/x402/discovery/search?query=inference` returns the
+catalog reputation-ranked (Sonnet > Opus > Haiku). Seller API keys land in
+`.seed/api-key{,-dataco,-gpufarm}`. Re-running is safe: keys are reused and
+existing services are looked up rather than re-created.
 
 ## What runs
 

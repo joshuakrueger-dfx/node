@@ -43,4 +43,9 @@ curl -sf -X POST "$API/api/zk402/authorizations" -H 'content-type: application/j
 {"payer":"$PAYER","network":"zkcoins:regtest","expiresAt":"$(date -u -r $((NOW+86400)) +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d @$((NOW+86400)) +%Y-%m-%dT%H:%M:%SZ)","allowedMerchants":["merchant_demo"],"spendLimitTotal":"100000","facilitator":"http://localhost:4242","signature":"demo-auth-sig"}
 JSON
 )" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);require("fs").writeFileSync(".seed/channel",j.authorizationId);console.log("channel:",j.authorizationId)}catch(e){console.log("channel create:",s)}})'
+
+# 6. Seed the Bazaar: 3 demo sellers + curated service catalog + reputation.
+echo "seeding bazaar (3 sellers, services, reputation)…"
+ZK402_API="$API" node seed-bazaar.mjs
+
 echo "seed complete."
