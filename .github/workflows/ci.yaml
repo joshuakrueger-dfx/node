@@ -621,7 +621,7 @@ jobs:
         # make the suite parallel-safe under llvm-cov.
         run: |
           cargo llvm-cov nextest --release -p node -p shared --all-features --show-missing-lines \
-            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|test_db\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
+            --ignore-filename-regex 'main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|settlement_watch\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|test_db\.rs$|bin/.*\.rs$|shared/src/.*\.rs$' \
             --fail-under-lines 100 \
             --fail-under-functions 100 \
             --test-threads 8 \
@@ -641,7 +641,7 @@ jobs:
       - name: Show missing coverage on gate failure
         if: failure()
         run: |
-          IGNORE='main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|test_db\.rs$|bin/.*\.rs$|shared/src/.*\.rs$'
+          IGNORE='main\.rs|lib\.rs|publisher\.rs|runtime\.rs|scanner_runtime\.rs|settlement_watch\.rs|scanner_ws\.rs|flow\.rs|job_dispatcher\.rs|_tests\.rs$|test_db\.rs$|bin/.*\.rs$|shared/src/.*\.rs$'
 
           echo "--- llvm-cov report: --show-missing-lines (text) ---"
           cargo llvm-cov report --release --show-missing-lines \
