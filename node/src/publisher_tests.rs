@@ -56,6 +56,23 @@ async fn setup_mock_esplora() -> (MockServer, EsploraConfig) {
     (mock_server, config)
 }
 
+#[test]
+fn network_maps_mainnet_signet_and_regtest() {
+    let cfg = |is_mainnet: bool, name: &str| EsploraConfig {
+        url: "http://x".to_string(),
+        is_mainnet,
+        network_name: name.to_string(),
+        ws_url: None,
+    };
+    assert_eq!(cfg(true, "Mainnet").network(), Network::Bitcoin);
+    assert_eq!(cfg(false, "Mutinynet").network(), Network::Signet);
+    // Local hermetic test chain — case-insensitive, only when not mainnet.
+    assert_eq!(cfg(false, "Regtest").network(), Network::Regtest);
+    assert_eq!(cfg(false, "regtest").network(), Network::Regtest);
+    // Mainnet wins even if the label says regtest (defensive).
+    assert_eq!(cfg(true, "regtest").network(), Network::Bitcoin);
+}
+
 // -----------------------------------------------------------------------------
 // Pure logic: inscription_txs
 // -----------------------------------------------------------------------------

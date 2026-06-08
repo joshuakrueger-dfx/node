@@ -46,6 +46,14 @@ impl EsploraConfig {
     pub fn network(&self) -> Network {
         if self.is_mainnet {
             Network::Bitcoin
+        } else if self.network_name.eq_ignore_ascii_case("regtest") {
+            // Local hermetic test chain (zkcoins-agent-testlab): bitcoind in
+            // regtest gives instant `generatetoaddress` mining + trivial
+            // funding, so real on-chain settlement (Taproot `4242` inscribe ->
+            // scanner observe -> 6-conf final) runs in milliseconds. Only
+            // reachable when IS_MAINNET=false AND NETWORK_NAME=Regtest — never
+            // in DEV (Signet/Mutinynet) or PRD (mainnet).
+            Network::Regtest
         } else {
             Network::Signet
         }
