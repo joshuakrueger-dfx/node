@@ -804,6 +804,27 @@ pub struct ChannelSummary {
 
 /// List metering channels visible to a merchant (allow-list contains the
 /// merchant, or is empty = any). Newest first.
+/// Whether a metering channel is visible to a merchant — the SAME
+/// predicate `list_channels_for_merchant` uses (open allow-list, or the
+/// merchant is named in it). Usage reads MUST gate on this so one merchant
+/// cannot read another's channel usage by id (no cross-merchant IDOR).
+pub async fn channel_visible_to_merchant(
+    pool: &PgPool,
+    channel_id: &str,
+    merchant_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let visible: Option<bool> = sqlx::query_scalar(
+        "SELECT (allowed_merchants = '[]'::jsonb OR allowed_merchants @> $2::jsonb) \
+         FROM zk402_authorizations \
+         WHERE id = $1 AND channel_mode = 'metering'",
+    )
+    .bind(channel_id)
+    .bind(serde_json::json!([merchant_id]))
+    .fetch_optional(pool)
+    .await?;
+    Ok(visible.unwrap_or(false))
+}
+
 pub async fn list_channels_for_merchant(
     pool: &PgPool,
     merchant_id: &str,

@@ -282,10 +282,14 @@ async fn supported_adverts_testnets_never_mainnet() {
     let (app, _scope) = env().await;
     let (status, body) = get_json(&app, "/v2/x402/supported", None).await;
     assert_eq!(status, StatusCode::OK);
+    // Spec envelope: extensions + signers present.
+    assert!(body["extensions"].is_array());
+    assert!(body["signers"].is_object());
     let kinds = body["kinds"].as_array().unwrap();
     assert_eq!(kinds.len(), 3);
     for kind in kinds {
         assert_eq!(kind["scheme"], "zkcoins-publisher");
+        assert_eq!(kind["x402Version"], 2, "per-kind version required by spec");
         assert_ne!(kind["network"], "zkcoins:mainnet");
     }
 }

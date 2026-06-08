@@ -649,6 +649,23 @@ async fn dashboard_usage_handler(
         Ok(m) => m,
         Err((code, body)) => return (StatusCode::from_u16(code).unwrap(), body),
     };
+    // Channel-ownership gate: a merchant may only read usage for a channel
+    // its allow-list admits — never another merchant's channel by id.
+    match super::store::channel_visible_to_merchant(&s.pool, &q.channel, &merchant).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "not_found", "message": "unknown channel" })),
+            )
+        }
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "unavailable" })),
+            )
+        }
+    }
     let events = super::store::list_usage_events(&s.pool, &q.channel, 100)
         .await
         .unwrap_or_default();
@@ -691,13 +708,15 @@ async fn get_receipt_handler(
 // ---- Agent Economy Layer 1: discovery + service registration ----------------
 
 /// `GET /v2/x402/supported` — advertise the scheme(s) + (testnet)
-/// networks this facilitator settles, x402 `/supported` shape.
+/// networks this facilitator settles, x402 `/supported` shape. Each kind
+/// carries its own `x402Version`, and the envelope includes `extensions`
+/// and `signers` for conformant consumers.
 async fn supported_handler(State(_s): State<Zk402State>) -> Json<Value> {
     let kinds: Vec<Value> = super::payload::SUPPORTED_NETWORKS
         .iter()
-        .map(|n| json!({ "scheme": super::payload::SCHEME, "network": n }))
+        .map(|n| json!({ "x402Version": 2, "scheme": super::payload::SCHEME, "network": n }))
         .collect();
-    Json(json!({ "x402Version": 2, "kinds": kinds }))
+    Json(json!({ "x402Version": 2, "kinds": kinds, "extensions": [], "signers": {} }))
 }
 
 /// Build discovery items for a batch of services, each enriched with its

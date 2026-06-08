@@ -72,7 +72,10 @@ async fn score_rewards_payer_diversity_and_punishes_failures() {
     })
     .0;
     assert!(wash < 65, "single-payer wash farm must stay low: {wash}");
-    assert!(wash < 90, "wash farm must not clear the score>90 filter: {wash}");
+    assert!(
+        wash < 90,
+        "wash farm must not clear the score>90 filter: {wash}"
+    );
     assert!(wash < big, "wash {wash} must not reach diverse {big}");
 
     // Failures pull the rate down hard.
@@ -409,6 +412,62 @@ async fn discovery_search_ranks_by_reputation() {
         .as_i64()
         .unwrap();
     assert!(good_score > bad_score, "{good_score} !> {bad_score}");
+}
+
+#[tokio::test]
+async fn search_ranks_globally_not_within_recency_window() {
+    // Register more services than the search return limit (20); the FIRST
+    // (oldest) gets a high reputation. A recency-windowed ranker would cut
+    // it before ranking; the global ranker must still surface it #1.
+    let (app, scope) = router().await;
+    onboard_merchant(&scope.pool, "merchant_1", "M", "addr", "zk402_sk_one")
+        .await
+        .unwrap();
+    let oldest = register(&app, "rankcap", 5).await;
+    let oldest_h = store::load_service(&scope.pool, &oldest)
+        .await
+        .unwrap()
+        .unwrap()
+        .resource_hash;
+    // 24 newer, history-less services (all score 50).
+    for _ in 0..24 {
+        register(&app, "rankcap", 5).await;
+    }
+    // Give the oldest a strong, diverse record → near-100 score.
+    for i in 0..22 {
+        store::insert_payment_intent(
+            &scope.pool,
+            &intent_p(
+                &format!("o{i}"),
+                &oldest_h,
+                10,
+                S::Final,
+                &format!("zkpayer_{i:03}"),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    let (status, body) = get_json(
+        &app,
+        "/v2/x402/discovery/search?query=rankcap&limit=20",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let resources = body["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 20, "trimmed to limit");
+    // The oldest service — beyond a 20-row recency window — ranks #1.
+    assert_eq!(resources[0]["metadata"]["serviceId"], oldest);
+    assert!(
+        resources[0]["metadata"]["reputation"]["score"]
+            .as_i64()
+            .unwrap()
+            >= 95
+    );
+    // More matches than returned → partialResults true.
+    assert_eq!(body["partialResults"], true);
 }
 
 #[tokio::test]

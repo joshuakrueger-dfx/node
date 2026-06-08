@@ -220,6 +220,48 @@ async fn dashboard_reads_require_key_and_scope_to_merchant() {
 }
 
 #[tokio::test]
+async fn usage_is_not_readable_across_merchants() {
+    // IDOR guard: another merchant must not read merchant_1's channel usage
+    // just by knowing the channel id.
+    let (app, key, scope) = env().await;
+    let (kp, payer) = keypair();
+    channel(&scope.pool, &payer, 1_000).await; // allowed_merchants = [merchant_1]
+    let now = Utc::now().timestamp();
+    post(
+        &app,
+        "/v2/x402/stream/meter",
+        &stream_body(&kp, &payer, 1, 100, 100, now),
+    )
+    .await;
+
+    // A second merchant with its own key.
+    onboard_merchant(&scope.pool, "merchant_2", "M2", "addr2", "zk402_sk_two")
+        .await
+        .unwrap();
+
+    // merchant_1 (owner) sees the usage.
+    let (status, body) = get_auth(
+        &app,
+        "/api/zk402/dashboard/usage?channel=chan_1",
+        Some(&key),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["usage"].as_array().unwrap().len(), 1);
+
+    // merchant_2 is authenticated but NOT on the channel allow-list → 404,
+    // never the data.
+    let (status, body) = get_auth(
+        &app,
+        "/api/zk402/dashboard/usage?channel=chan_1",
+        Some("zk402_sk_two"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.get("usage").is_none(), "no usage leaked: {body}");
+}
+
+#[tokio::test]
 async fn receipts_endpoint_returns_full_signed_receipt() {
     use super::canonical::voucher_signing_digest;
     use super::payload::ParsedPayment;
