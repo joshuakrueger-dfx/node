@@ -13,8 +13,9 @@ use crate::test_db::setup_pool;
 use super::batch::{retry_failed_batch, run_batch_cycle, BatchPolicy};
 use super::error::Zk402Error;
 use super::settlement::{
-    confirm_batch, finalize_batch, resume_pending_batches, settle_batch, BroadcastFailing,
-    MockSettlement, ProverFailing, UnfundedPublisher,
+    advance_intent_settlement, confirm_batch, confirmations, finalize_batch,
+    record_receive_observation, resume_pending_batches, settle_batch, settlement_state_for,
+    BroadcastFailing, MockSettlement, ProverFailing, UnfundedPublisher, FINALITY_CONFIRMATIONS,
 };
 use super::store;
 use super::types::{
@@ -220,4 +221,213 @@ async fn interrupted_batches_resume_to_locked() {
         .unwrap();
     let b = store::load_batch(pool, &batch_id).await.unwrap().unwrap();
     assert_eq!(b.status, BatchStatus::Published);
+}
+
+// --- Receive-driven finality (migration 0019) --------------------------------
+
+#[test]
+fn confirmations_and_state_thresholds() {
+    // Inclusion block counts as the first confirmation; forward anchors clamp.
+    assert_eq!(confirmations(100, 100), 1);
+    assert_eq!(confirmations(104, 100), 5);
+    assert_eq!(confirmations(105, 100), 6);
+    assert_eq!(confirmations(99, 100), 0);
+    // 0 = mempool → published; 1..5 → confirmed; >=6 → final (PDF §3.9/§3.10).
+    assert_eq!(settlement_state_for(0), PaymentIntentStatus::Published);
+    assert_eq!(settlement_state_for(1), PaymentIntentStatus::Confirmed);
+    assert_eq!(settlement_state_for(5), PaymentIntentStatus::Confirmed);
+    assert_eq!(
+        settlement_state_for(FINALITY_CONFIRMATIONS),
+        PaymentIntentStatus::Final
+    );
+}
+
+async fn seed_merchant_and_intent(pool: &sqlx::PgPool, mid: &str, iid: &str, amount: i64) {
+    let _ = store::insert_merchant(
+        pool,
+        &NewMerchant {
+            id: mid.to_owned(),
+            display_name: "M".to_owned(),
+            settlement_address: "zk1qm".to_owned(),
+            username: None,
+            status: MerchantStatus::Active,
+            fee_bps: 0,
+            fixed_fee_sats: 0,
+        },
+    )
+    .await;
+    let now = Utc::now();
+    let p = NewPaymentIntent {
+        id: iid.to_owned(),
+        voucher_id: format!("v_{iid}"),
+        authorization_id: None,
+        payer: "zkpayer_x".to_owned(),
+        merchant_id: mid.to_owned(),
+        network: "zkcoins:regtest".to_owned(),
+        asset: "btc-sats".to_owned(),
+        amount_sats: amount,
+        fee_amount_sats: 0,
+        resource_hash: "sha256:aa".to_owned(),
+        request_hash: format!("sha256:{iid}"),
+        nonce: format!("n_{iid}"),
+        valid_after: now - chrono::Duration::hours(1),
+        valid_before: now + chrono::Duration::hours(1),
+        canonical_message: "m".to_owned(),
+        signature_scheme: "bip340-schnorr".to_owned(),
+        signature: "sig".to_owned(),
+        status: PaymentIntentStatus::Received,
+        access_threshold: super::types::AccessThreshold::PublisherAccepted,
+    };
+    store::insert_payment_intent(pool, &p).await.unwrap();
+}
+
+#[tokio::test]
+async fn advance_drives_published_confirmed_final_from_observations() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    seed_merchant_and_intent(pool, "m1", "pi1", 100).await;
+    sqlx::query("UPDATE zk402_payment_intents SET receiving_address = 'addr_pi1' WHERE id = 'pi1'")
+        .execute(pool)
+        .await
+        .unwrap();
+    let now = Utc::now().timestamp();
+
+    // (a) mempool observation (no block) → published.
+    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, None, now)
+        .await
+        .unwrap();
+    assert_eq!(
+        advance_intent_settlement(pool, "pi1", 0, now)
+            .await
+            .unwrap(),
+        Some(PaymentIntentStatus::Published)
+    );
+
+    // (b) mined at block 100, tip 100 → 1 conf → confirmed.
+    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(100), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        advance_intent_settlement(pool, "pi1", 100, now)
+            .await
+            .unwrap(),
+        Some(PaymentIntentStatus::Confirmed)
+    );
+
+    // (c) tip 105 → 6 conf → final + single ledger credit.
+    assert_eq!(
+        advance_intent_settlement(pool, "pi1", 105, now)
+            .await
+            .unwrap(),
+        Some(PaymentIntentStatus::Final)
+    );
+    let intent = store::load_payment_intent(pool, "pi1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(intent.status, PaymentIntentStatus::Final);
+    let ledger = store::list_merchant_settlements(pool, "m1").await.unwrap();
+    let finals: Vec<_> = ledger
+        .iter()
+        .filter(|s| s.kind == SettlementKind::Final)
+        .collect();
+    assert_eq!(finals.len(), 1);
+    assert_eq!(finals[0].amount_sats, 100);
+
+    // (d) idempotent: re-advancing a final intent is a no-op (no double credit).
+    assert_eq!(
+        advance_intent_settlement(pool, "pi1", 110, now)
+            .await
+            .unwrap(),
+        None
+    );
+    let ledger2 = store::list_merchant_settlements(pool, "m1").await.unwrap();
+    assert_eq!(
+        ledger2
+            .iter()
+            .filter(|s| s.kind == SettlementKind::Final)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn advance_is_fail_closed_without_address_observation_or_amount() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    seed_merchant_and_intent(pool, "m1", "pi1", 100).await;
+    let now = Utc::now().timestamp();
+
+    // No receiving address → unchanged.
+    assert_eq!(
+        advance_intent_settlement(pool, "pi1", 200, now)
+            .await
+            .unwrap(),
+        None
+    );
+
+    // Address set but no observation → unchanged.
+    sqlx::query("UPDATE zk402_payment_intents SET receiving_address = 'addr_x' WHERE id = 'pi1'")
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        advance_intent_settlement(pool, "pi1", 200, now)
+            .await
+            .unwrap(),
+        None
+    );
+
+    // Underpaid observation (50 < 100) → unchanged, no credit.
+    record_receive_observation(pool, Some("pi1"), "addr_x", 50, Some(100), now)
+        .await
+        .unwrap();
+    assert_eq!(
+        advance_intent_settlement(pool, "pi1", 200, now)
+            .await
+            .unwrap(),
+        None
+    );
+    let intent = store::load_payment_intent(pool, "pi1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(intent.status, PaymentIntentStatus::Received);
+}
+
+#[tokio::test]
+async fn watch_advances_only_address_bound_intents() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    seed_merchant_and_intent(pool, "m1", "pi1", 100).await;
+    seed_merchant_and_intent(pool, "m1", "pi2", 100).await; // no address bound
+    store::set_receiving_address(pool, "pi1", "addr_pi1")
+        .await
+        .unwrap();
+    let now = Utc::now().timestamp();
+    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(100), now)
+        .await
+        .unwrap();
+
+    // tip 105 → 6 conf → pi1 finalizes; pi2 (no address) is untouched.
+    let moved = super::settlement_watch::advance_due_intents(pool, 105, now)
+        .await
+        .unwrap();
+    assert_eq!(moved, 1);
+    assert_eq!(
+        store::load_payment_intent(pool, "pi1")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PaymentIntentStatus::Final
+    );
+    assert_eq!(
+        store::load_payment_intent(pool, "pi2")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PaymentIntentStatus::Received
+    );
 }

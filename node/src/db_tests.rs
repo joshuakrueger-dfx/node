@@ -78,6 +78,8 @@ async fn connect_and_migrate_creates_all_tables() {
     //   * After 0017 (zk402 streaming):    33 tables + 1 view (ZK402
     //     publisher payment layer — Step 1 DB & domain; see
     //     `node/src/zk402/`.)
+    //   * After 0018 (zk402 services):     34 tables + 1 view
+    //   * After 0019 (zk402 settlement observation): 35 tables + 1 view
     assert_eq!(
         names,
         vec![
@@ -115,6 +117,7 @@ async fn connect_and_migrate_creates_all_tables() {
             "zk402_payment_intents".to_string(),
             "zk402_receipts".to_string(),
             "zk402_services".to_string(),
+            "zk402_settlement_observations".to_string(),
             "zk402_usage_events".to_string(),
         ]
     );

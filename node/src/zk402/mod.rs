@@ -43,6 +43,7 @@ pub mod reputation;
 pub mod routes;
 pub mod services;
 pub mod settlement;
+pub mod settlement_watch;
 pub mod signature;
 pub mod store;
 pub mod streaming;

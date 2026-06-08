@@ -206,6 +206,28 @@ async fn main() -> Result<(), Box<dyn StdError>> {
     let (tip_tx, tip_rx) = mpsc::channel::<bitcoin::BlockHash>(64);
     tokio::spawn(run_scanner_ws(ws_config, tip_tx));
 
+    // ZK402 settlement watcher (migration 0019): derive each receive-correlated
+    // intent's finality from the real chain state (>= 6 confirmations). OFF by
+    // default — the offline test env / CI never run it (the stub cannot mine);
+    // enable with ZK402_SETTLEMENT_WATCH=1 against a real chain. First
+    // production ZK402 runtime loop. See docs/ZK402_SPEC_ALIGNMENT.md.
+    if std::env::var("ZK402_SETTLEMENT_WATCH").as_deref() == Ok("1") {
+        let pool_for_watch = (*pool).clone();
+        let cfg_for_watch = network_config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = node::zk402::settlement_watch::run_settlement_watch(
+                &pool_for_watch,
+                &cfg_for_watch,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            {
+                eprintln!("zk402 settlement watch exited: {e:?}");
+            }
+        });
+        println!("ZK402 settlement watch: ENABLED (30s tick)");
+    }
+
     scan_for_inscriptions(network_config, start_block_hash, Some(pool_for_scanner), &move |content_bytes: Vec<u8>, commit_txid, current_block_hash| {
         println!("Received content size: {} bytes", content_bytes.len());
 

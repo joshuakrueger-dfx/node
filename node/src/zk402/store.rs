@@ -390,6 +390,30 @@ pub async fn update_payment_intent_status(
     Ok(res.rows_affected() == 1)
 }
 
+/// Bind a UNIQUE per-intent zkCoins receiving address (migration 0019).
+///
+/// Receive-driven finality (`settlement::advance_intent_settlement`)
+/// correlates an incoming coin to exactly this intent by its address, so the
+/// merchant MUST supply a fresh address per intent — a shared address would
+/// make the correlation ambiguous (several intents advancing on one receive).
+/// Until an address is bound, the intent is not receive-correlated and never
+/// advances past its current status (fail-closed).
+pub async fn set_receiving_address(
+    pool: &PgPool,
+    intent_id: &str,
+    receiving_address: &str,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE zk402_payment_intents \
+         SET receiving_address = $2, updated_at = now() WHERE id = $1",
+    )
+    .bind(intent_id)
+    .bind(receiving_address)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 /// Persist the zkCoins publisher-acceptance id on an intent (settle
 /// records it as soon as the publisher accepts; Step-8's real backend
 /// reuses the same column).

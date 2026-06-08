@@ -298,3 +298,167 @@ pub async fn resume_pending_batches(pool: &PgPool) -> Result<u64, Zk402Error> {
     .map_err(db_err)?;
     Ok(res.rows_affected())
 }
+
+// ===========================================================================
+// Receive-driven finality (real zkCoins settlement, migration 0019).
+//
+// Instead of the mocked batch path above, a per-intent settlement is driven
+// by the ACTUAL incoming transfer on the intent's unique receiving address:
+// the scanner / `/api/receive` seam records an observation, and a runtime
+// watcher advances the intent published -> confirmed -> final from the
+// observed confirmation depth (PDF §3.9). Correlation is 1:1 by receiving
+// address, so no memo field is needed. See docs/ZK402_SPEC_ALIGNMENT.md.
+// ===========================================================================
+
+/// Confirmation depth at which a settlement is final (Protocol Spec §3.9:
+/// zkCoins fixes finality at 6 confirmations).
+pub const FINALITY_CONFIRMATIONS: i64 = 6;
+
+/// Confirmations of an inscription mined at `block_height` given the current
+/// chain `tip_height`. The inclusion block counts as the first confirmation;
+/// clamped to >= 0 (a not-yet-mined / forward anchor yields 0).
+pub fn confirmations(tip_height: i64, block_height: i64) -> i64 {
+    (tip_height - block_height + 1).max(0)
+}
+
+/// Map a confirmation depth to the ZK402 settlement status (PDF §3.10):
+/// 0 = inscribed / in mempool → `published`; 1..5 → `confirmed`;
+/// >= 6 → `final` (the receiver may credit).
+pub fn settlement_state_for(confs: i64) -> PaymentIntentStatus {
+    if confs >= FINALITY_CONFIRMATIONS {
+        PaymentIntentStatus::Final
+    } else if confs >= 1 {
+        PaymentIntentStatus::Confirmed
+    } else {
+        PaymentIntentStatus::Published
+    }
+}
+
+/// Forward-only rank of the receive-driven settlement states, so `advance`
+/// never downgrades (e.g. a transient re-observation can't push `confirmed`
+/// back to `published`). Non-settlement statuses rank 0 so the first real
+/// observation can lift them.
+fn settle_rank(status: &str) -> i32 {
+    match status {
+        "published" => 1,
+        "confirmed" => 2,
+        "final" => 3,
+        _ => 0,
+    }
+}
+
+/// Integration seam: record an on-chain receive crediting a per-intent
+/// receiving address. The real scanner / `/api/receive` path calls this once
+/// a `4242` inscription paying `receiving_address` is integrated (block_height
+/// = the inclusion block, or `None` while still in mempool). Append-only.
+pub async fn record_receive_observation(
+    pool: &PgPool,
+    payment_intent_id: Option<&str>,
+    receiving_address: &str,
+    amount_sats: i64,
+    block_height: Option<i64>,
+    now: i64,
+) -> Result<(), Zk402Error> {
+    sqlx::query(
+        "INSERT INTO zk402_settlement_observations \
+         (payment_intent_id, receiving_address, amount_sats, block_height, observed_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(payment_intent_id)
+    .bind(receiving_address)
+    .bind(amount_sats)
+    .bind(block_height)
+    .bind(ts(now))
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+/// Advance one intent's settlement from the real receive state. Loads the
+/// intent's receiving address + amount, takes the latest observation for that
+/// address, computes confirmations against `tip_height`, and moves the intent
+/// forward published → confirmed → final. At `final` it posts the SINGLE
+/// merchant credit (deterministic id + `ON CONFLICT DO NOTHING`) — idempotent,
+/// never double-credits — and flips the `accepted` ledger entry to `posted`.
+///
+/// Fail-closed and forward-only: no receiving address, no observation, an
+/// under-amount, or no forward progress all leave the intent unchanged
+/// (`Ok(None)`). Terminal intents are never touched.
+pub async fn advance_intent_settlement(
+    pool: &PgPool,
+    intent_id: &str,
+    tip_height: i64,
+    now: i64,
+) -> Result<Option<PaymentIntentStatus>, Zk402Error> {
+    let row: Option<(Option<String>, i64, String, String)> = sqlx::query_as(
+        "SELECT receiving_address, amount_sats, merchant_id, status \
+         FROM zk402_payment_intents WHERE id = $1",
+    )
+    .bind(intent_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    let (recv_addr, amount_sats, merchant, cur_status) = match row {
+        Some((Some(a), amt, m, s)) if !a.is_empty() => (a, amt, m, s),
+        _ => return Ok(None), // unknown / not receive-correlated
+    };
+    if matches!(
+        cur_status.as_str(),
+        "final" | "failed_terminal" | "reversed" | "expired"
+    ) {
+        return Ok(None);
+    }
+
+    let obs: Option<(i64, Option<i64>)> = sqlx::query_as(
+        "SELECT amount_sats, block_height FROM zk402_settlement_observations \
+         WHERE receiving_address = $1 ORDER BY observed_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&recv_addr)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    let (obs_amount, block_height) = match obs {
+        Some(o) => o,
+        None => return Ok(None), // not received yet — fail-closed
+    };
+    if obs_amount < amount_sats {
+        return Ok(None); // underpaid — do not credit
+    }
+
+    let confs = block_height.map_or(0, |h| confirmations(tip_height, h));
+    let target = settlement_state_for(confs);
+    if settle_rank(target.as_str()) <= settle_rank(&cur_status) {
+        return Ok(None); // no forward progress
+    }
+
+    store::update_payment_intent_status(pool, intent_id, target, ts(now))
+        .await
+        .map_err(db_err)?;
+
+    if target == PaymentIntentStatus::Final {
+        // Single, exactly-once final credit (deterministic id).
+        sqlx::query(
+            "INSERT INTO zk402_merchant_settlements \
+             (id, merchant_id, payment_intent_id, batch_id, kind, amount_sats, status) \
+             VALUES ($1, $2, $3, NULL, 'final', $4, 'posted') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(format!("stl_final_{intent_id}"))
+        .bind(&merchant)
+        .bind(intent_id)
+        .bind(amount_sats)
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE zk402_merchant_settlements SET status = 'posted' \
+             WHERE id = $1 AND status = 'pending'",
+        )
+        .bind(format!("stl_accepted_{intent_id}"))
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+    }
+    Ok(Some(target))
+}
