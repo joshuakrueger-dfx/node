@@ -1,14 +1,24 @@
 //! Agent Economy Phase 1 — Layer 3 (identity + delegation) + Layer 4 (disputes).
 //!
 //! Self-sovereign agent identities keyed by a Schnorr key; delegated, scoped,
-//! revocable session keys authorized via `ZK402-AUTHORIZATION-V1` (closing the
-//! `authorization.rs` seam — the identity key signs the delegation, the session
-//! key then signs vouchers within the caps); and append-only signed
-//! `ZK402-DISPUTE-V1` ratings bound to a settled receipt.
+//! revocable session keys authorized via `ZK402-AUTHORIZATION-V1` (the identity
+//! key signs the delegation; the caps/window/revocation are enforced at USE
+//! time by [`validate_session_delegation`]); and append-only signed
+//! `ZK402-DISPUTE-V1` ratings, each bound to the receipt's own payer.
 //!
-//! All writes are signature-gated. Nothing here holds funds, a handle maps to a
-//! key (never a human), so the zkCoins unlinkability property is preserved.
+//! All writes are signature-gated and freshness-bounded (a signed message older
+//! or further in the future than `FRESHNESS_WINDOW_SECS` is rejected, so a stale
+//! registration/delegation/dispute cannot be replayed). Nothing here holds
+//! funds; an agent has no owner column (a handle maps to a key, never a human),
+//! preserving the zkCoins unlinkability property.
+//!
+//! NOTE: `validate_session_delegation` is the enforcement primitive; wiring it
+//! into the voucher-accept path (`facilitator::accept_voucher_against_authorization`)
+//! so a session-key-signed voucher is checked against its delegation is the final
+//! integration step (the existing settle path still enforces via the older
+//! `zk402_authorizations` table).
 
+use chrono::{DateTime, TimeZone, Utc};
 use sqlx::PgPool;
 
 use super::canonical::{
@@ -18,6 +28,23 @@ use super::error::Zk402Error;
 use super::signature::{
     verify_agent_signature, verify_authorization_signature, verify_dispute_signature,
 };
+
+/// A signed message's timestamp must be within this window of `now`, so a
+/// captured registration/delegation/dispute cannot be replayed later (or
+/// pre-dated). Generous (1 day) to tolerate clock skew.
+pub const FRESHNESS_WINDOW_SECS: i64 = 86_400;
+
+fn fresh(timestamp: i64, now: i64) -> Result<(), Zk402Error> {
+    if (now - timestamp).abs() <= FRESHNESS_WINDOW_SECS {
+        Ok(())
+    } else {
+        Err(Zk402Error::InvalidPayload)
+    }
+}
+
+fn ts(unix: i64) -> DateTime<Utc> {
+    Utc.timestamp_opt(unix, 0).single().unwrap_or_else(Utc::now)
+}
 
 fn db_err(_: sqlx::Error) -> Zk402Error {
     Zk402Error::SettlementQueueUnavailable
@@ -42,8 +69,15 @@ pub struct RegisterAgent {
 }
 
 /// Register (or update) an agent identity, proving control of the identity key
-/// via a `ZK402-AGENT-V1` signature. Owner stays private — only the key.
-pub async fn register_agent(pool: &PgPool, req: &RegisterAgent) -> Result<(), Zk402Error> {
+/// via a `ZK402-AGENT-V1` signature. Owner stays private — only the key. The
+/// signed `timestamp` must be fresh, so a captured registration cannot be
+/// replayed later to roll the handle/capabilities back.
+pub async fn register_agent(
+    pool: &PgPool,
+    req: &RegisterAgent,
+    now: i64,
+) -> Result<(), Zk402Error> {
+    fresh(req.timestamp, now)?;
     let fields = AgentFields {
         agent_id: req.agent_id.clone(),
         handle: req.handle.clone().unwrap_or_default(),
@@ -84,9 +118,17 @@ pub struct AddSessionKey {
 }
 
 /// Add a delegated session key under an agent's identity, verifying the
-/// `ZK402-AUTHORIZATION-V1` delegation signed by the identity key. Returns the
-/// session-key row id.
-pub async fn add_session_key(pool: &PgPool, req: &AddSessionKey) -> Result<String, Zk402Error> {
+/// `ZK402-AUTHORIZATION-V1` delegation signed by the identity key. The window
+/// must be valid and not already expired at creation. Returns the row id.
+pub async fn add_session_key(
+    pool: &PgPool,
+    req: &AddSessionKey,
+    now: i64,
+) -> Result<String, Zk402Error> {
+    // A well-formed, not-already-expired window.
+    if req.valid_before <= req.valid_after || req.valid_before <= now {
+        return Err(Zk402Error::InvalidPayload);
+    }
     let amh = allowed_merchants_hash(&req.allowed_merchants);
     let fields = AuthorizationFields {
         network: req.network.clone(),
@@ -112,13 +154,16 @@ pub async fn add_session_key(pool: &PgPool, req: &AddSessionKey) -> Result<Strin
         return Err(Zk402Error::InvalidPayload); // unknown agent
     }
 
+    let merchants_json =
+        serde_json::to_string(&req.allowed_merchants).unwrap_or_else(|_| "[]".to_owned());
     let id = format!("sk_{}", req.session_pubkey);
     sqlx::query(
         "INSERT INTO zk402_agent_session_keys \
          (id, agent_id, session_pubkey, scope_json, authorized_amount_sats, \
           spend_limit_per_request_sats, spend_limit_total_sats, allowed_merchants_hash, \
-          facilitator, network, valid_after, valid_before, delegation_signature) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+          allowed_merchants_json, facilitator, network, valid_after, valid_before, \
+          delegation_signature) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
     )
     .bind(&id)
     .bind(&req.agent_id)
@@ -128,6 +173,7 @@ pub async fn add_session_key(pool: &PgPool, req: &AddSessionKey) -> Result<Strin
     .bind(req.spend_limit_per_request_sats)
     .bind(req.spend_limit_total_sats)
     .bind(&amh)
+    .bind(&merchants_json)
     .bind(&req.facilitator)
     .bind(&req.network)
     .bind(req.valid_after)
@@ -139,6 +185,71 @@ pub async fn add_session_key(pool: &PgPool, req: &AddSessionKey) -> Result<Strin
     Ok(id)
 }
 
+/// Revoke a delegated session key (stamps `revoked_at`). After this,
+/// [`validate_session_delegation`] rejects it. Idempotent. Returns whether a
+/// row was revoked.
+pub async fn revoke_session_key(
+    pool: &PgPool,
+    session_pubkey: &str,
+    now: i64,
+) -> Result<bool, Zk402Error> {
+    let res = sqlx::query(
+        "UPDATE zk402_agent_session_keys SET revoked_at = $2 \
+         WHERE session_pubkey = $1 AND revoked_at IS NULL",
+    )
+    .bind(session_pubkey)
+    .bind(ts(now))
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(res.rows_affected() == 1)
+}
+
+/// Enforcement primitive — validate a session-key-signed spend against its
+/// stored delegation: the key must exist, be unrevoked, be inside its window,
+/// the amount within the per-request cap, and the merchant in the allow-list.
+/// This is what the settle path calls to make the delegation's caps/window/
+/// revocation actually bite (the final wiring into the voucher-accept path is
+/// the remaining integration step).
+pub async fn validate_session_delegation(
+    pool: &PgPool,
+    session_pubkey: &str,
+    amount_sats: i64,
+    merchant: &str,
+    now: i64,
+) -> Result<(), Zk402Error> {
+    // (per_request_cap, valid_after, valid_before, allowed_hash, allowed_json, revoked_at)
+    type DelegationRow = (i64, i64, i64, String, String, Option<DateTime<Utc>>);
+    let row: Option<DelegationRow> = sqlx::query_as(
+        "SELECT spend_limit_per_request_sats, valid_after, valid_before, \
+         allowed_merchants_hash, allowed_merchants_json, revoked_at \
+         FROM zk402_agent_session_keys WHERE session_pubkey = $1",
+    )
+    .bind(session_pubkey)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    let (per_req, valid_after, valid_before, amh, merchants_json, revoked_at) =
+        row.ok_or(Zk402Error::InvalidPayload)?; // unknown session key
+    if revoked_at.is_some() {
+        return Err(Zk402Error::InvalidSignature); // revoked
+    }
+    if now < valid_after || now >= valid_before {
+        return Err(Zk402Error::InvalidSignature); // outside window
+    }
+    if amount_sats > per_req {
+        return Err(Zk402Error::InvalidPayload); // over per-request cap
+    }
+    // Merchant must be in the signed allow-list. Re-derive the hash from the
+    // stored set and confirm it matches what was signed (tamper guard), then
+    // check membership.
+    let merchants: Vec<String> = serde_json::from_str(&merchants_json).unwrap_or_default();
+    if allowed_merchants_hash(&merchants) != amh || !merchants.iter().any(|m| m == merchant) {
+        return Err(Zk402Error::InvalidPayload); // merchant not in the signed allow-list
+    }
+    Ok(())
+}
+
 // ---- Layer 4: signed disputes (ZK402-DISPUTE-V1) ---------------------------
 
 pub struct FileDispute {
@@ -148,16 +259,22 @@ pub struct FileDispute {
     pub reason_hash: String,
     pub timestamp: i64,
     pub signature: String,
-    pub counter_signature: Option<String>,
 }
 
-/// File an append-only signed dispute/rating bound to a settled receipt,
-/// verifying the complainant's `ZK402-DISPUTE-V1` signature. Idempotent per
-/// (receipt, complainant). Returns the dispute row id.
-pub async fn file_dispute(pool: &PgPool, req: &FileDispute) -> Result<String, Zk402Error> {
+/// File an append-only signed dispute/rating. The complainant's
+/// `ZK402-DISPUTE-V1` signature is verified AND the complainant MUST be the
+/// receipt's own payer — so a third party cannot file ratings against a
+/// payment they had no part in (reputation poisoning). Freshness-bounded,
+/// idempotent per (receipt, complainant). Returns the dispute row id.
+pub async fn file_dispute(
+    pool: &PgPool,
+    req: &FileDispute,
+    now: i64,
+) -> Result<String, Zk402Error> {
     if !matches!(req.verdict.as_str(), "ok" | "bad" | "refunded") {
         return Err(Zk402Error::InvalidPayload);
     }
+    fresh(req.timestamp, now)?;
     let fields = DisputeFields {
         receipt_id: req.receipt_id.clone(),
         complainant: req.complainant.clone(),
@@ -167,20 +284,27 @@ pub async fn file_dispute(pool: &PgPool, req: &FileDispute) -> Result<String, Zk
     };
     verify_dispute_signature(&fields, &req.signature)?;
 
-    // The receipt must exist (FK also enforces; check for a clean error).
-    let receipt: Option<String> = sqlx::query_scalar("SELECT id FROM zk402_receipts WHERE id = $1")
-        .bind(&req.receipt_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(db_err)?;
-    if receipt.is_none() {
-        return Err(Zk402Error::InvalidPayload); // unknown receipt
+    // Bind the complainant to the receipt's PAYER: only the party that actually
+    // paid for this receipt may rate it. Unknown receipt or mismatched payer →
+    // rejected (no third-party reputation poisoning).
+    let payer: Option<String> = sqlx::query_scalar(
+        "SELECT pi.payer FROM zk402_receipts r \
+         JOIN zk402_payment_intents pi ON pi.id = r.payment_intent_id \
+         WHERE r.id = $1",
+    )
+    .bind(&req.receipt_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    match payer {
+        Some(p) if p == req.complainant => {}
+        _ => return Err(Zk402Error::InvalidPayload),
     }
 
     let id = format!("dsp_{}_{}", req.receipt_id, req.complainant);
     sqlx::query(
         "INSERT INTO zk402_disputes \
-         (id, receipt_id, complainant, verdict, reason_hash, attestation_signature, counter_signature) \
+         (id, receipt_id, complainant, verdict, reason_hash, attestation_signature, signed_timestamp) \
          VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO NOTHING",
     )
     .bind(&id)
@@ -189,7 +313,7 @@ pub async fn file_dispute(pool: &PgPool, req: &FileDispute) -> Result<String, Zk
     .bind(&req.verdict)
     .bind(&req.reason_hash)
     .bind(&req.signature)
-    .bind(req.counter_signature.as_deref())
+    .bind(req.timestamp)
     .execute(pool)
     .await
     .map_err(db_err)?;

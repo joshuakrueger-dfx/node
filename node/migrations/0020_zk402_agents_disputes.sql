@@ -36,6 +36,7 @@ CREATE TABLE zk402_agent_session_keys (
     spend_limit_per_request_sats  BIGINT NOT NULL DEFAULT 0,
     spend_limit_total_sats        BIGINT NOT NULL DEFAULT 0,
     allowed_merchants_hash TEXT,
+    allowed_merchants_json TEXT      NOT NULL DEFAULT '[]',   -- the signed set, for membership checks
     facilitator          TEXT        NOT NULL,
     network              TEXT        NOT NULL,
     valid_after          BIGINT      NOT NULL,          -- unix seconds (matches the signed message)
@@ -50,11 +51,11 @@ CREATE UNIQUE INDEX zk402_agent_session_keys_pubkey_uq ON zk402_agent_session_ke
 CREATE TABLE zk402_disputes (
     id                     TEXT        PRIMARY KEY,
     receipt_id             TEXT        NOT NULL REFERENCES zk402_receipts(id),
-    complainant            TEXT        NOT NULL,        -- payer key
+    complainant            TEXT        NOT NULL,        -- = the receipt's payer (enforced in file_dispute)
     verdict                TEXT        NOT NULL,
     reason_hash            TEXT        NOT NULL,
     attestation_signature  TEXT        NOT NULL,        -- complainant sig over ZK402-DISPUTE-V1
-    counter_signature      TEXT,                        -- optional merchant counter-sig
+    signed_timestamp       BIGINT      NOT NULL,        -- the signed timestamp, so the attestation is offline-verifiable
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (verdict IN ('ok','bad','refunded'))
 );

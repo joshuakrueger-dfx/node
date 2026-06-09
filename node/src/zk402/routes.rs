@@ -162,7 +162,7 @@ async fn register_agent_handler(
         timestamp: req.get("timestamp").and_then(Value::as_i64).unwrap_or(0),
         signature,
     };
-    match super::agents::register_agent(&s.pool, &r).await {
+    match super::agents::register_agent(&s.pool, &r, chrono::Utc::now().timestamp()).await {
         Ok(()) => (
             StatusCode::CREATED,
             Json(json!({ "agentId": agent_id, "handle": r.handle })),
@@ -223,7 +223,7 @@ async fn add_session_key_handler(
             .unwrap_or_else(|| "{}".to_owned()),
         delegation_signature,
     };
-    match super::agents::add_session_key(&s.pool, &r).await {
+    match super::agents::add_session_key(&s.pool, &r, chrono::Utc::now().timestamp()).await {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "sessionKeyId": id }))),
         Err(e) => (
             StatusCode::from_u16(agent_err_status(&e)).unwrap(),
@@ -261,9 +261,8 @@ async fn file_dispute_handler(
         reason_hash,
         timestamp: req.get("timestamp").and_then(Value::as_i64).unwrap_or(0),
         signature,
-        counter_signature: get("counterSignature"),
     };
-    match super::agents::file_dispute(&s.pool, &r).await {
+    match super::agents::file_dispute(&s.pool, &r, chrono::Utc::now().timestamp()).await {
         Ok(id) => (StatusCode::CREATED, Json(json!({ "disputeId": id }))),
         Err(e) => (
             StatusCode::from_u16(agent_err_status(&e)).unwrap(),
