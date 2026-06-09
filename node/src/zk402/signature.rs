@@ -15,7 +15,10 @@
 use bitcoin::secp256k1::{schnorr::Signature, Message, XOnlyPublicKey};
 use shared::SECP256K1;
 
-use super::canonical::{voucher_signing_digest, VoucherFields};
+use super::canonical::{
+    agent_signing_digest, authorization_signing_digest, dispute_signing_digest,
+    voucher_signing_digest, AgentFields, AuthorizationFields, DisputeFields, VoucherFields,
+};
 use super::error::Zk402Error;
 
 /// The payer identity prefix: `zkpayer_<64-hex-x-only-pubkey>`.
@@ -61,6 +64,52 @@ pub fn verify_voucher_signature(
     let pubkey = payer_to_xonly(&fields.payer)?;
     let sig = parse_signature_hex(signature_hex)?;
     let digest = voucher_signing_digest(fields);
+    if verify_schnorr_raw(&pubkey, &digest, &sig) {
+        Ok(())
+    } else {
+        Err(Zk402Error::InvalidSignature)
+    }
+}
+
+/// Verify an agent registration: the identity key (`agent_id`) signs the
+/// canonical `ZK402-AGENT-V1` digest, proving control of the key.
+pub fn verify_agent_signature(fields: &AgentFields, signature_hex: &str) -> Result<(), Zk402Error> {
+    let pubkey = payer_to_xonly(&fields.agent_id)?;
+    let sig = parse_signature_hex(signature_hex)?;
+    let digest = agent_signing_digest(fields);
+    if verify_schnorr_raw(&pubkey, &digest, &sig) {
+        Ok(())
+    } else {
+        Err(Zk402Error::InvalidSignature)
+    }
+}
+
+/// Verify a delegation: the agent's IDENTITY key (`identity_payer`) signs the
+/// canonical `ZK402-AUTHORIZATION-V1` digest to authorize a session key. This
+/// is the real signature check that closes the `authorization.rs` seam.
+pub fn verify_authorization_signature(
+    fields: &AuthorizationFields,
+    signature_hex: &str,
+) -> Result<(), Zk402Error> {
+    let pubkey = payer_to_xonly(&fields.identity_payer)?;
+    let sig = parse_signature_hex(signature_hex)?;
+    let digest = authorization_signing_digest(fields);
+    if verify_schnorr_raw(&pubkey, &digest, &sig) {
+        Ok(())
+    } else {
+        Err(Zk402Error::InvalidSignature)
+    }
+}
+
+/// Verify a dispute attestation: the complainant (payer) key signs the
+/// canonical `ZK402-DISPUTE-V1` digest.
+pub fn verify_dispute_signature(
+    fields: &DisputeFields,
+    signature_hex: &str,
+) -> Result<(), Zk402Error> {
+    let pubkey = payer_to_xonly(&fields.complainant)?;
+    let sig = parse_signature_hex(signature_hex)?;
+    let digest = dispute_signing_digest(fields);
     if verify_schnorr_raw(&pubkey, &digest, &sig) {
         Ok(())
     } else {

@@ -108,7 +108,168 @@ pub fn create_zk402_router(state: Zk402State) -> Router {
             "/api/zk402/dashboard/services",
             axum::routing::get(dashboard_services_handler),
         )
+        // Agent Economy Phase 1 — Layer 3 (identity + delegation) +
+        // Layer 4 (signed disputes). All signature-gated, all public POST
+        // (the signature IS the auth); never any payout route.
+        .route("/api/zk402/agents", post(register_agent_handler))
+        .route(
+            "/api/zk402/agents/:id/session-keys",
+            post(add_session_key_handler),
+        )
+        .route("/api/zk402/disputes", post(file_dispute_handler))
         .with_state(state)
+}
+
+// ---- Agent Economy Phase 1 handlers ----------------------------------------
+
+fn agent_err_status(e: &Zk402Error) -> u16 {
+    match e {
+        Zk402Error::ReplayDetected => 409,
+        Zk402Error::InvalidSignature => 401,
+        _ => 400,
+    }
+}
+
+async fn register_agent_handler(
+    State(s): State<Zk402State>,
+    Json(req): Json<Value>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    let get = |k: &str| req.get(k).and_then(Value::as_str).map(str::to_owned);
+    let (agent_id, signature) = match (get("agentId"), get("signature")) {
+        (Some(a), Some(sig)) => (a, sig),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_payload",
+                    "message": "agentId and signature are required" })),
+            )
+        }
+    };
+    let capabilities: Vec<String> = req
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let r = super::agents::RegisterAgent {
+        agent_id: agent_id.clone(),
+        handle: get("handle"),
+        capabilities,
+        timestamp: req.get("timestamp").and_then(Value::as_i64).unwrap_or(0),
+        signature,
+    };
+    match super::agents::register_agent(&s.pool, &r).await {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(json!({ "agentId": agent_id, "handle": r.handle })),
+        ),
+        Err(e) => (
+            StatusCode::from_u16(agent_err_status(&e)).unwrap(),
+            Json(json!({ "error": e.code() })),
+        ),
+    }
+}
+
+async fn add_session_key_handler(
+    State(s): State<Zk402State>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+    Json(req): Json<Value>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    let get = |k: &str| req.get(k).and_then(Value::as_str).map(str::to_owned);
+    let i64f = |k: &str| req.get(k).and_then(Value::as_i64).unwrap_or(0);
+    let (session_pubkey, network, facilitator, delegation_signature) = match (
+        get("sessionPubkey"),
+        get("network"),
+        get("facilitator"),
+        get("delegationSignature"),
+    ) {
+        (Some(p), Some(n), Some(f), Some(sig)) => (p, n, f, sig),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_payload",
+                    "message": "sessionPubkey, network, facilitator, delegationSignature are required" })),
+            )
+        }
+    };
+    let allowed_merchants: Vec<String> = req
+        .get("allowedMerchants")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let r = super::agents::AddSessionKey {
+        agent_id,
+        session_pubkey,
+        network,
+        authorized_amount_sats: i64f("authorizedAmountSats"),
+        spend_limit_per_request_sats: i64f("spendLimitPerRequestSats"),
+        spend_limit_total_sats: i64f("spendLimitTotalSats"),
+        allowed_merchants,
+        facilitator,
+        valid_after: i64f("validAfter"),
+        valid_before: i64f("validBefore"),
+        scope_json: req
+            .get("scope")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "{}".to_owned()),
+        delegation_signature,
+    };
+    match super::agents::add_session_key(&s.pool, &r).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "sessionKeyId": id }))),
+        Err(e) => (
+            StatusCode::from_u16(agent_err_status(&e)).unwrap(),
+            Json(json!({ "error": e.code() })),
+        ),
+    }
+}
+
+async fn file_dispute_handler(
+    State(s): State<Zk402State>,
+    Json(req): Json<Value>,
+) -> (axum::http::StatusCode, Json<Value>) {
+    use axum::http::StatusCode;
+    let get = |k: &str| req.get(k).and_then(Value::as_str).map(str::to_owned);
+    let (receipt_id, complainant, verdict, reason_hash, signature) = match (
+        get("receiptId"),
+        get("complainant"),
+        get("verdict"),
+        get("reasonHash"),
+        get("signature"),
+    ) {
+        (Some(r), Some(c), Some(v), Some(rh), Some(sig)) => (r, c, v, rh, sig),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_payload",
+                    "message": "receiptId, complainant, verdict, reasonHash, signature are required" })),
+            )
+        }
+    };
+    let r = super::agents::FileDispute {
+        receipt_id,
+        complainant,
+        verdict,
+        reason_hash,
+        timestamp: req.get("timestamp").and_then(Value::as_i64).unwrap_or(0),
+        signature,
+        counter_signature: get("counterSignature"),
+    };
+    match super::agents::file_dispute(&s.pool, &r).await {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "disputeId": id }))),
+        Err(e) => (
+            StatusCode::from_u16(agent_err_status(&e)).unwrap(),
+            Json(json!({ "error": e.code() })),
+        ),
+    }
 }
 
 /// Pull the `paymentPayload` object out of the x402 v2 request envelope

@@ -365,3 +365,154 @@ pub fn stream_signing_digest(f: &StreamVoucherFields) -> [u8; 32] {
     hasher.update(canonical_stream_message(f));
     hasher.finalize().into()
 }
+
+// ---- ZK402-AUTHORIZATION-V1 (Layer 3 delegation message) --------------------
+//
+// The missing canonical message the `session_public_key` is delegated under
+// (closes the authorization.rs seam). The agent's IDENTITY key signs this to
+// authorize a short-lived, capped SESSION key; the session key then signs
+// vouchers within the caps. Same byte discipline as ZK402-V1.
+
+/// Hash of the allowed-merchants set, so the signed delegation stays compact
+/// and order-independent. Empty set → hash of the empty string.
+pub fn allowed_merchants_hash(merchants: &[String]) -> String {
+    let mut sorted: Vec<&str> = merchants.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut hasher = Sha256::new();
+    hasher.update(sorted.join(",").as_bytes());
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+/// Order-independent hash of an agent's capability set (for `ZK402-AGENT-V1`).
+pub fn capabilities_hash(capabilities: &[String]) -> String {
+    let mut sorted: Vec<&str> = capabilities.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut hasher = Sha256::new();
+    hasher.update(sorted.join(",").as_bytes());
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+/// Fields of the `ZK402-AUTHORIZATION-V1` delegation message.
+pub struct AuthorizationFields {
+    pub network: String,
+    pub identity_payer: String,
+    pub session_pubkey: String,
+    pub authorized_amount_sats: i64,
+    pub spend_limit_per_request_sats: i64,
+    pub spend_limit_total_sats: i64,
+    pub allowed_merchants_hash: String,
+    pub facilitator: String,
+    pub valid_after: i64,
+    pub valid_before: i64,
+}
+
+/// Build the canonical `ZK402-AUTHORIZATION-V1` bytes (ASCII, LF, fixed order,
+/// no trailing newline). BIP-340-signed by the identity key.
+pub fn canonical_authorization_message(f: &AuthorizationFields) -> Vec<u8> {
+    format!(
+        "ZK402-AUTHORIZATION-V1\n\
+         scheme=zkcoins-publisher\n\
+         network={}\n\
+         identity_payer={}\n\
+         session_pubkey={}\n\
+         authorized_amount={}\n\
+         spend_limit_per_request={}\n\
+         spend_limit_total={}\n\
+         allowed_merchants_hash={}\n\
+         facilitator={}\n\
+         valid_after={}\n\
+         valid_before={}",
+        f.network,
+        f.identity_payer,
+        f.session_pubkey,
+        f.authorized_amount_sats,
+        f.spend_limit_per_request_sats,
+        f.spend_limit_total_sats,
+        f.allowed_merchants_hash,
+        f.facilitator,
+        f.valid_after,
+        f.valid_before,
+    )
+    .into_bytes()
+}
+
+/// The 32-byte BIP-340 signing digest for an authorization delegation.
+pub fn authorization_signing_digest(f: &AuthorizationFields) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_authorization_message(f));
+    hasher.finalize().into()
+}
+
+// ---- ZK402-AGENT-V1 (Layer 3 identity registration) -------------------------
+//
+// Proves control of the identity key when registering an agent / claiming a
+// handle. Signed by the identity key (`agent_id`).
+
+/// Fields of the `ZK402-AGENT-V1` registration message.
+pub struct AgentFields {
+    pub agent_id: String,
+    pub handle: String,
+    pub capabilities_hash: String,
+    pub timestamp: i64,
+}
+
+/// Build the canonical `ZK402-AGENT-V1` bytes (ASCII, LF, fixed order, no
+/// trailing newline). BIP-340-signed by the identity key.
+pub fn canonical_agent_message(f: &AgentFields) -> Vec<u8> {
+    format!(
+        "ZK402-AGENT-V1\n\
+         scheme=zkcoins-publisher\n\
+         agent_id={}\n\
+         handle={}\n\
+         capabilities_hash={}\n\
+         timestamp={}",
+        f.agent_id, f.handle, f.capabilities_hash, f.timestamp,
+    )
+    .into_bytes()
+}
+
+/// The 32-byte BIP-340 signing digest for an agent registration.
+pub fn agent_signing_digest(f: &AgentFields) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_agent_message(f));
+    hasher.finalize().into()
+}
+
+// ---- ZK402-DISPUTE-V1 (Layer 4 signed rating) -------------------------------
+//
+// A rating bound to a settled receipt. BIP-340-signed by the complainant
+// (payer) key; an optional merchant counter-signature uses the same message.
+
+/// Fields of the `ZK402-DISPUTE-V1` rating message.
+pub struct DisputeFields {
+    pub receipt_id: String,
+    pub complainant: String,
+    pub verdict: String,
+    pub reason_hash: String,
+    pub timestamp: i64,
+}
+
+/// Build the canonical `ZK402-DISPUTE-V1` bytes (ASCII, LF, fixed order, no
+/// trailing newline). BIP-340-signed by the complainant key.
+pub fn canonical_dispute_message(f: &DisputeFields) -> Vec<u8> {
+    format!(
+        "ZK402-DISPUTE-V1\n\
+         scheme=zkcoins-publisher\n\
+         receipt_id={}\n\
+         complainant={}\n\
+         verdict={}\n\
+         reason_hash={}\n\
+         timestamp={}",
+        f.receipt_id, f.complainant, f.verdict, f.reason_hash, f.timestamp,
+    )
+    .into_bytes()
+}
+
+/// The 32-byte BIP-340 signing digest for a dispute attestation.
+pub fn dispute_signing_digest(f: &DisputeFields) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_dispute_message(f));
+    hasher.finalize().into()
+}
