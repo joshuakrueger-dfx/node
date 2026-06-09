@@ -12,11 +12,13 @@
 //! funds; an agent has no owner column (a handle maps to a key, never a human),
 //! preserving the zkCoins unlinkability property.
 //!
-//! NOTE: `validate_session_delegation` is the enforcement primitive; wiring it
-//! into the voucher-accept path (`facilitator::accept_voucher_against_authorization`)
-//! so a session-key-signed voucher is checked against its delegation is the final
-//! integration step (the existing settle path still enforces via the older
-//! `zk402_authorizations` table).
+//! `validate_session_delegation` is the enforcement primitive;
+//! [`enforce_session_delegation`] wires it into the settle path
+//! (`facilitator::settle`), so a voucher signed by a delegated session key
+//! (`zkpayer_<session_pubkey>`) is checked against its delegation at spend
+//! time — the caps/window/revocation now actually bite. (The separate
+//! `zk402_authorizations` table still backs the older authorization-mode
+//! voucher path; the two coexist.)
 
 use chrono::{DateTime, TimeZone, Utc};
 use sqlx::PgPool;
@@ -113,7 +115,6 @@ pub struct AddSessionKey {
     pub facilitator: String,
     pub valid_after: i64,
     pub valid_before: i64,
-    pub scope_json: String,
     pub delegation_signature: String,
 }
 
@@ -159,16 +160,15 @@ pub async fn add_session_key(
     let id = format!("sk_{}", req.session_pubkey);
     sqlx::query(
         "INSERT INTO zk402_agent_session_keys \
-         (id, agent_id, session_pubkey, scope_json, authorized_amount_sats, \
+         (id, agent_id, session_pubkey, authorized_amount_sats, \
           spend_limit_per_request_sats, spend_limit_total_sats, allowed_merchants_hash, \
           allowed_merchants_json, facilitator, network, valid_after, valid_before, \
           delegation_signature) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
     )
     .bind(&id)
     .bind(&req.agent_id)
     .bind(&req.session_pubkey)
-    .bind(&req.scope_json)
     .bind(req.authorized_amount_sats)
     .bind(req.spend_limit_per_request_sats)
     .bind(req.spend_limit_total_sats)
@@ -250,6 +250,40 @@ pub async fn validate_session_delegation(
     Ok(())
 }
 
+/// Settle-path hook — make a delegated session key's caps actually bite.
+///
+/// A voucher whose payer is `zkpayer_<session_pubkey>` for a key present in
+/// `zk402_agent_session_keys` is a *delegated* spend: it MUST satisfy that
+/// delegation (revocation / validity window / per-request cap / merchant
+/// allow-list) via [`validate_session_delegation`]. A payer that is not a
+/// known session key is an ordinary buyer and passes through untouched — so
+/// this is a no-op for the non-delegated path and only constrains keys that
+/// an identity actually delegated. Called from `facilitator::settle`.
+pub async fn enforce_session_delegation(
+    pool: &PgPool,
+    payer: &str,
+    amount_sats: i64,
+    merchant: &str,
+    now: i64,
+) -> Result<(), Zk402Error> {
+    // `zkpayer_<hex>` is the only payer form a session key can take; anything
+    // else is definitionally not a delegated key.
+    let Some(session_pubkey) = payer.strip_prefix("zkpayer_") else {
+        return Ok(());
+    };
+    let known: Option<String> = sqlx::query_scalar(
+        "SELECT session_pubkey FROM zk402_agent_session_keys WHERE session_pubkey = $1",
+    )
+    .bind(session_pubkey)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    if known.is_none() {
+        return Ok(()); // ordinary buyer payer, not a delegated session key
+    }
+    validate_session_delegation(pool, session_pubkey, amount_sats, merchant, now).await
+}
+
 // ---- Layer 4: signed disputes (ZK402-DISPUTE-V1) ---------------------------
 
 pub struct FileDispute {
@@ -302,7 +336,7 @@ pub async fn file_dispute(
     }
 
     let id = format!("dsp_{}_{}", req.receipt_id, req.complainant);
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO zk402_disputes \
          (id, receipt_id, complainant, verdict, reason_hash, attestation_signature, signed_timestamp) \
          VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO NOTHING",
@@ -317,5 +351,23 @@ pub async fn file_dispute(
     .execute(pool)
     .await
     .map_err(db_err)?;
+    // A pre-existing row is idempotent ONLY if it is the SAME rating. A second
+    // dispute by the same complainant on the same receipt with a DIFFERENT
+    // verdict/reason is a conflicting re-rating — surface it as a replay/
+    // conflict rather than silently swallowing it (the append-only ledger must
+    // not let a later mind-change masquerade as success).
+    if inserted.rows_affected() == 0 {
+        let existing: Option<(String, String)> =
+            sqlx::query_as("SELECT verdict, reason_hash FROM zk402_disputes WHERE id = $1")
+                .bind(&id)
+                .fetch_optional(pool)
+                .await
+                .map_err(db_err)?;
+        match existing {
+            Some((v, rh)) if v == req.verdict && rh == req.reason_hash => {} // idempotent
+            Some(_) => return Err(Zk402Error::ReplayDetected), // conflicting re-rating
+            None => return Err(Zk402Error::SettlementQueueUnavailable), // lost row (race)
+        }
+    }
     Ok(id)
 }

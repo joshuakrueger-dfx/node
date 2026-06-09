@@ -240,6 +240,33 @@ pub async fn settle(
         }
     }
 
+    // Session-key delegation enforcement: if the voucher's payer is a
+    // delegated session key (`zkpayer_<session_pubkey>` known to
+    // `zk402_agent_session_keys`), its delegation — revocation, validity
+    // window, per-request cap, merchant allow-list — MUST hold. Like the
+    // authorization branch above, a rejection marks the already-persisted
+    // intent failed (non-custodial: no granted-but-unrecorded spend). An
+    // ordinary buyer payer is not a known session key and passes through.
+    if let Err(e) = super::agents::enforce_session_delegation(
+        pool,
+        &payload.payer,
+        payload.amount_sats,
+        &payload.merchant,
+        now,
+    )
+    .await
+    {
+        let _ = store::fail_payment_intent(
+            pool,
+            &payload.intent_id,
+            PaymentIntentStatus::FailedTerminal,
+            e.code(),
+            "session delegation check failed",
+        )
+        .await;
+        return Err(e);
+    }
+
     // Publisher acceptance (mocked today). On failure, record the
     // terminal reason on the intent and surface the structured error.
     let publisher_acceptance_id = match publisher.accept(payload) {

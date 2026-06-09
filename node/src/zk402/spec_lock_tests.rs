@@ -26,7 +26,11 @@ use tower::ServiceExt;
 
 use crate::test_db::{setup_pool, SchemaScope};
 
-use super::canonical::voucher_signing_digest;
+use super::canonical::{
+    allowed_merchants_hash, canonical_agent_message, canonical_authorization_message,
+    canonical_dispute_message, capabilities_hash, voucher_signing_digest, AgentFields,
+    AuthorizationFields, DisputeFields,
+};
 use super::facilitator::MockPublisherAccept;
 use super::payload::ParsedPayment;
 use super::receipt::ReceiptSigner;
@@ -272,5 +276,72 @@ async fn production_schema_has_no_custodial_fields() {
         zk402_tables.len() >= 9,
         "expected the full zk402 surface, got {}",
         zk402_tables.len()
+    );
+}
+
+// ---- Agent Economy Layer 3/4 canonical goldens (cross-language pin) ----------
+// The EXACT same strings are asserted in the `@zk402/sdk` test
+// (`test/core.test.ts`), so the Rust and TS encoders for AGENT/AUTHORIZATION/
+// DISPUTE-V1 are byte-for-byte identical. A divergence silently breaks every
+// cross-language agent registration / delegation / dispute signature.
+
+const AGENT_GOLDEN: &str = "ZK402-AGENT-V1\nscheme=zkcoins-publisher\nagent_id=zkpayer_aa\nhandle=research-bot\ncapabilities_hash=sha256:2a95c57618561f09ecde2762140e55e0023c4b93a6c237b9381fc598880d6295\ntimestamp=1779900000";
+const DISPUTE_GOLDEN: &str = "ZK402-DISPUTE-V1\nscheme=zkcoins-publisher\nreceipt_id=zkr_1\ncomplainant=zkpayer_aa\nverdict=bad\nreason_hash=sha256:dd\ntimestamp=1779900000";
+// `session_pubkey` is a 64-hex (32-byte) x-only key — spliced from
+// `"bb".repeat(32)` on BOTH sides (here and in the SDK test) so the byte-run
+// is identical without hand-counting; everything around it is frozen literal.
+const AUTHORIZATION_GOLDEN_TMPL: &str = "ZK402-AUTHORIZATION-V1\nscheme=zkcoins-publisher\nnetwork=zkcoins:regtest\nidentity_payer=zkpayer_aa\nsession_pubkey={SP}\nauthorized_amount=10000\nspend_limit_per_request=1000\nspend_limit_total=10000\nallowed_merchants_hash=sha256:24492c8500aeda60ef07a717b25e0b3a368ffa595bd8fcc0db16f942f2fda831\nfacilitator=https://facilitator.test\nvalid_after=1779900000\nvalid_before=1779986400";
+
+#[test]
+fn agent_economy_canonical_matches_cross_language_goldens() {
+    let authorization_golden = AUTHORIZATION_GOLDEN_TMPL.replace("{SP}", &"bb".repeat(32));
+    // Order-independent hashes pinned to the values embedded in the goldens.
+    assert_eq!(
+        capabilities_hash(&["research".to_owned(), "ocr".to_owned(), "ocr".to_owned()]),
+        "sha256:2a95c57618561f09ecde2762140e55e0023c4b93a6c237b9381fc598880d6295"
+    );
+    assert_eq!(
+        allowed_merchants_hash(&["merchant_1".to_owned()]),
+        "sha256:24492c8500aeda60ef07a717b25e0b3a368ffa595bd8fcc0db16f942f2fda831"
+    );
+
+    let agent = AgentFields {
+        agent_id: "zkpayer_aa".to_owned(),
+        handle: "research-bot".to_owned(),
+        capabilities_hash: capabilities_hash(&["ocr".to_owned(), "research".to_owned()]),
+        timestamp: 1_779_900_000,
+    };
+    assert_eq!(
+        String::from_utf8(canonical_agent_message(&agent)).unwrap(),
+        AGENT_GOLDEN
+    );
+
+    let auth = AuthorizationFields {
+        network: "zkcoins:regtest".to_owned(),
+        identity_payer: "zkpayer_aa".to_owned(),
+        session_pubkey: "bb".repeat(32),
+        authorized_amount_sats: 10_000,
+        spend_limit_per_request_sats: 1_000,
+        spend_limit_total_sats: 10_000,
+        allowed_merchants_hash: allowed_merchants_hash(&["merchant_1".to_owned()]),
+        facilitator: "https://facilitator.test".to_owned(),
+        valid_after: 1_779_900_000,
+        valid_before: 1_779_986_400,
+    };
+    assert_eq!(
+        String::from_utf8(canonical_authorization_message(&auth)).unwrap(),
+        authorization_golden
+    );
+
+    let dispute = DisputeFields {
+        receipt_id: "zkr_1".to_owned(),
+        complainant: "zkpayer_aa".to_owned(),
+        verdict: "bad".to_owned(),
+        reason_hash: "sha256:dd".to_owned(),
+        timestamp: 1_779_900_000,
+    };
+    assert_eq!(
+        String::from_utf8(canonical_dispute_message(&dispute)).unwrap(),
+        DISPUTE_GOLDEN
     );
 }

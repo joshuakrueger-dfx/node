@@ -10,7 +10,8 @@
 //! numbers offline; v1 intentionally has NO snapshot table — derived
 //! state stays derived.
 //!
-//! v1 signals (disputes land in Phase 1 and will add `dispute_rate`):
+//! Signals (signed, payer-bound `bad`/`refunded` disputes now feed the
+//! score multiplicatively — see [`score`] / [`DISPUTE_PENALTY_WEIGHT`]):
 //!
 //! * `settled_count` — intents the publisher ACCEPTED (status at/past
 //!   `publisher_accepted`); this is acceptance, not on-chain finality,
@@ -65,6 +66,13 @@ pub struct ReputationSignals {
     pub finalized_count: i64,
     pub failed_count: i64,
     pub reversed_count: i64,
+    /// Signed, payer-bound disputes (`zk402_disputes`) filed against this
+    /// service's receipts — any verdict (ok/bad/refunded). Surfaced for
+    /// transparency; only the bad/refunded subset moves the score.
+    pub dispute_count: i64,
+    /// Disputes with a `bad`/`refunded` verdict. These erode the score
+    /// multiplicatively via the dispute factor in [`score`].
+    pub bad_dispute_count: i64,
     pub volume_sats: i64,
     pub volume_30d_sats: i64,
     pub median_settle_latency_ms: Option<f64>,
@@ -85,12 +93,20 @@ pub struct Reputation {
 /// only one distinct payer).
 pub const CONFIDENCE_SATURATION_PAYERS: f64 = 20.0;
 
+/// How many "negative settles" each bad/refunded dispute counts as in the
+/// multiplicative dispute factor. With weight 2, a service with one settle
+/// and one bad dispute keeps factor `1/(1+2)≈0.33` — trust drops sharply but
+/// not to zero on the first complaint; the factor degrades with the bad
+/// dispute *rate*, not its raw count.
+pub const DISPUTE_PENALTY_WEIGHT: f64 = 2.0;
+
 /// The v1 scoring function — small, documented, deterministic:
 ///
 /// ```text
-/// success_rate = settled / (settled + failed + reversed)        (1.0 if no history)
-/// confidence   = ln(1 + distinct_payers) / ln(1 + 20)           (clamped to 1)
-/// score        = round(100 * success_rate * (0.5 + 0.5 * confidence))
+/// success_rate   = settled / (settled + failed + reversed)      (1.0 if no history)
+/// confidence     = ln(1 + distinct_payers) / ln(1 + 20)         (clamped to 1)
+/// dispute_factor = settled / (settled + 2 * bad_disputes)       (1.0 if none)
+/// score          = round(100 * success_rate * (0.5 + 0.5 * confidence) * dispute_factor)
 /// ```
 ///
 /// Properties: a service with no history scores 50 (neutral). Confidence
@@ -98,10 +114,13 @@ pub const CONFIDENCE_SATURATION_PAYERS: f64 = 20.0;
 /// wash-settling from one key cannot lift the score past ~59 no matter how
 /// many self-payments are made — diversity, not volume, is what the score
 /// rewards. Failures/reversals pull `success_rate` (and thus the score)
-/// down immediately. `success_rate` is over *accepted* payments
-/// (publisher-acceptance), not on-chain finality; finality is surfaced
-/// separately as `finalized_count`, and weighting the score on it is a
-/// Phase-1 item once real settlement lands.
+/// down immediately. Signed, payer-bound `bad`/`refunded` disputes erode
+/// the score through a separate multiplicative `dispute_factor` (see
+/// [`DISPUTE_PENALTY_WEIGHT`]); with no bad disputes the factor is exactly
+/// 1.0, so disputes only ever subtract. `success_rate` is left as the pure
+/// *acceptance* rate (publisher-acceptance, not on-chain finality, not
+/// disputes) for transparency; finality is surfaced separately as
+/// `finalized_count`.
 pub fn score(signals: &ReputationSignals) -> (i64, f64) {
     let denom = signals.settled_count + signals.failed_count + signals.reversed_count;
     let success_rate = if denom == 0 {
@@ -112,7 +131,17 @@ pub fn score(signals: &ReputationSignals) -> (i64, f64) {
     let confidence = ((1.0 + signals.distinct_payers as f64).ln()
         / (1.0 + CONFIDENCE_SATURATION_PAYERS).ln())
     .clamp(0.0, 1.0);
-    let score = (100.0 * success_rate * (0.5 + 0.5 * confidence)).round() as i64;
+    // Bad/refunded disputes erode trust multiplicatively, by RATE not count:
+    // one bad dispute on a busy service barely registers; a high bad-rate
+    // collapses the factor toward 0. Exactly 1.0 when there are none, so the
+    // dispute term is purely subtractive and never inflates a score.
+    let dispute_factor = if signals.bad_dispute_count <= 0 {
+        1.0
+    } else {
+        let settled = signals.settled_count.max(0) as f64;
+        settled / (settled + DISPUTE_PENALTY_WEIGHT * signals.bad_dispute_count as f64)
+    };
+    let score = (100.0 * success_rate * (0.5 + 0.5 * confidence) * dispute_factor).round() as i64;
     (score, success_rate)
 }
 
@@ -198,8 +227,33 @@ pub async fn signals_for_resources(
                 volume_30d_sats: r.try_get("volume_30d_sats")?,
                 median_settle_latency_ms: r.try_get("median_settle_latency_ms")?,
                 first_settled_at: r.try_get("first_settled_at")?,
+                ..Default::default()
             },
         );
+    }
+
+    // Signed disputes fold in via receipt → intent → resource_hash. A dispute
+    // exists only against a real receipt (an accepted settle), so its
+    // resource_hash is already in `out`; `entry().or_default()` is just belt
+    // and braces. Only `bad`/`refunded` verdicts feed the score (see `score`).
+    let dispute_rows = sqlx::query(
+        "SELECT pi.resource_hash, \
+            COUNT(*) AS dispute_count, \
+            COUNT(*) FILTER (WHERE d.verdict IN ('bad','refunded')) AS bad_dispute_count \
+         FROM zk402_disputes d \
+         JOIN zk402_receipts rc ON rc.id = d.receipt_id \
+         JOIN zk402_payment_intents pi ON pi.id = rc.payment_intent_id \
+         WHERE pi.resource_hash = ANY($1) \
+         GROUP BY pi.resource_hash",
+    )
+    .bind(resource_hashes)
+    .fetch_all(pool)
+    .await?;
+    for r in dispute_rows {
+        let hash: String = r.try_get("resource_hash")?;
+        let entry = out.entry(hash).or_default();
+        entry.dispute_count = r.try_get("dispute_count")?;
+        entry.bad_dispute_count = r.try_get("bad_dispute_count")?;
     }
     Ok(out)
 }
@@ -221,6 +275,8 @@ pub fn reputation_json(rep: &Reputation, as_of: DateTime<Utc>) -> Value {
         "finalizedCount": rep.signals.finalized_count,
         "failedCount": rep.signals.failed_count,
         "reversedCount": rep.signals.reversed_count,
+        "disputeCount": rep.signals.dispute_count,
+        "badDisputeCount": rep.signals.bad_dispute_count,
         "volumeSats": rep.signals.volume_sats.to_string(),
         "volume30dSats": rep.signals.volume_30d_sats.to_string(),
         "medianSettleLatencyMs": rep.signals.median_settle_latency_ms,

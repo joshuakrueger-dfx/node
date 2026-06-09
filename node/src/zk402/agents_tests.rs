@@ -205,7 +205,6 @@ async fn delegate_session_key_then_enforce_caps_window_and_revocation() {
             facilitator: "https://f.test".to_owned(),
             valid_after: va,
             valid_before: vb,
-            scope_json: "{}".to_owned(),
             delegation_signature: sign(&authorization_signing_digest(&auth), &kp),
         },
         t,
@@ -260,7 +259,6 @@ async fn delegate_session_key_then_enforce_caps_window_and_revocation() {
                 facilitator: "https://f.test".to_owned(),
                 valid_after: t - 100,
                 valid_before: t - 50,
-                scope_json: "{}".to_owned(),
                 delegation_signature: "00".repeat(32),
             },
             t,
@@ -297,7 +295,6 @@ async fn delegate_session_key_then_enforce_caps_window_and_revocation() {
                 facilitator: "https://f.test".to_owned(),
                 valid_after: va,
                 valid_before: vb,
-                scope_json: "{}".to_owned(),
                 delegation_signature: sign(&authorization_signing_digest(&auth2), &kp2),
             },
             t,
@@ -397,6 +394,37 @@ async fn dispute_must_come_from_the_receipt_payer_and_is_idempotent() {
             .await
             .unwrap();
     assert_eq!(count, 1);
+
+    // A CONFLICTING re-rating (same receipt + complainant, different verdict)
+    // is NOT silently swallowed — it is a replay/conflict, not a success.
+    let conflicting = {
+        let d = DisputeFields {
+            receipt_id: "zkr_d1".to_owned(),
+            complainant: payer.clone(),
+            verdict: "refunded".to_owned(),
+            reason_hash: "sha256:dd".to_owned(),
+            timestamp: t,
+        };
+        FileDispute {
+            receipt_id: "zkr_d1".to_owned(),
+            complainant: payer.clone(),
+            verdict: "refunded".to_owned(),
+            reason_hash: "sha256:dd".to_owned(),
+            timestamp: t,
+            signature: sign(&dispute_signing_digest(&d), &kp),
+        }
+    };
+    assert!(matches!(
+        file_dispute(pool, &conflicting, t).await,
+        Err(Zk402Error::ReplayDetected)
+    ));
+    // The original verdict is unchanged (append-only, no overwrite).
+    let stored: String =
+        sqlx::query_scalar("SELECT verdict FROM zk402_disputes WHERE receipt_id = 'zkr_d1'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, "bad");
 
     // A DIFFERENT key (not the payer) signs validly but is REJECTED — no
     // third-party reputation poisoning.

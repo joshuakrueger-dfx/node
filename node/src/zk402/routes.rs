@@ -217,10 +217,6 @@ async fn add_session_key_handler(
         facilitator,
         valid_after: i64f("validAfter"),
         valid_before: i64f("validBefore"),
-        scope_json: req
-            .get("scope")
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "{}".to_owned()),
         delegation_signature,
     };
     match super::agents::add_session_key(&s.pool, &r, chrono::Utc::now().timestamp()).await {

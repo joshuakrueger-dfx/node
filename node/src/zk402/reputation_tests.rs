@@ -102,6 +102,39 @@ async fn score_rewards_payer_diversity_and_punishes_failures() {
     assert!((with_reversal.1 - 0.9).abs() < 1e-9);
 }
 
+#[tokio::test]
+async fn bad_disputes_apply_multiplicative_factor() {
+    let clean = ReputationSignals {
+        settled_count: 10,
+        distinct_payers: 10,
+        ..Default::default()
+    };
+    let base = reputation::score(&clean).0;
+    // One bad dispute on 10 settles → factor 10/(10+2)=0.833.
+    let one_bad = reputation::score(&ReputationSignals {
+        bad_dispute_count: 1,
+        ..clean.clone()
+    });
+    assert!(one_bad.0 < base, "{} !< {}", one_bad.0, base);
+    // success_rate (acceptance) is untouched by disputes.
+    assert!((one_bad.1 - 1.0).abs() < 1e-9);
+    // More bad disputes → strictly lower.
+    let three_bad = reputation::score(&ReputationSignals {
+        bad_dispute_count: 3,
+        ..clean.clone()
+    })
+    .0;
+    assert!(three_bad < one_bad.0, "{three_bad} !< {}", one_bad.0);
+    // No bad disputes → exactly the clean score (purely subtractive term).
+    let only_ok = reputation::score(&ReputationSignals {
+        dispute_count: 4,
+        bad_dispute_count: 0,
+        ..clean.clone()
+    })
+    .0;
+    assert_eq!(only_ok, base, "ok-only disputes never move the score");
+}
+
 // ---- DB-derived aggregates --------------------------------------------------
 
 fn intent(id: &str, rhash: &str, amount: i64, status: PaymentIntentStatus) -> NewPaymentIntent {
@@ -257,6 +290,93 @@ async fn distinct_payer_confidence_resists_wash_farming() {
         diverse_rep.score
     );
     assert!(diverse_rep.score > wash_rep.score + 30);
+}
+
+#[tokio::test]
+async fn bad_disputes_lower_score_clean_ratings_do_not() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    onboard_merchant(pool, "merchant_1", "M", "addr", "zk402_sk_one")
+        .await
+        .ok();
+    let rhash = "sha256:disputed_service";
+    // 5 clean, diverse settles → a solid baseline.
+    for i in 0..5 {
+        store::insert_payment_intent(
+            pool,
+            &intent_p(
+                &format!("p{i}"),
+                rhash,
+                100,
+                S::Final,
+                &format!("zkpayer_{i:03}"),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    let baseline = reputation::for_resource(pool, rhash).await.unwrap();
+    assert_eq!(baseline.signals.dispute_count, 0);
+    assert_eq!(baseline.signals.bad_dispute_count, 0);
+
+    // A receipt for one settle + a BAD dispute against it.
+    store::insert_receipt(pool, "zkr_p0", "p0", "final", &json!({"r":1}), "fsig")
+        .await
+        .unwrap();
+    let insert_dispute =
+        |id: &'static str, rid: &'static str, who: &'static str, verdict: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO zk402_disputes (id, receipt_id, complainant, verdict, \
+                 reason_hash, attestation_signature, signed_timestamp) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                )
+                .bind(id)
+                .bind(rid)
+                .bind(who)
+                .bind(verdict)
+                .bind("sha256:reason")
+                .bind("sig")
+                .bind(0i64)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+    insert_dispute("dsp_1", "zkr_p0", "zkpayer_000", "bad").await;
+
+    let after_bad = reputation::for_resource(pool, rhash).await.unwrap();
+    assert_eq!(after_bad.signals.dispute_count, 1);
+    assert_eq!(after_bad.signals.bad_dispute_count, 1);
+    // Acceptance rate is unchanged — only the dispute factor moves the score.
+    assert!((after_bad.success_rate - baseline.success_rate).abs() < 1e-9);
+    assert!(
+        after_bad.score < baseline.score,
+        "a bad dispute must lower the score: {} !< {}",
+        after_bad.score,
+        baseline.score
+    );
+
+    // An 'ok' verdict is recorded but is NOT a bad dispute → score unchanged.
+    store::insert_receipt(pool, "zkr_p1", "p1", "final", &json!({"r":1}), "fsig")
+        .await
+        .unwrap();
+    insert_dispute("dsp_2", "zkr_p1", "zkpayer_001", "ok").await;
+
+    let after_ok = reputation::for_resource(pool, rhash).await.unwrap();
+    assert_eq!(
+        after_ok.signals.dispute_count, 2,
+        "ok rating counts in total"
+    );
+    assert_eq!(
+        after_ok.signals.bad_dispute_count, 1,
+        "ok rating is not a bad dispute"
+    );
+    assert_eq!(
+        after_ok.score, after_bad.score,
+        "an ok rating does not move the score"
+    );
 }
 
 #[tokio::test]

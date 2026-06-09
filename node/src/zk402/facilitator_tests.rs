@@ -17,7 +17,13 @@ use shared::SECP256K1;
 
 use crate::test_db::setup_pool;
 
-use super::canonical::voucher_signing_digest;
+use super::agents::{
+    add_session_key, register_agent, revoke_session_key, AddSessionKey, RegisterAgent,
+};
+use super::canonical::{
+    agent_signing_digest, allowed_merchants_hash, authorization_signing_digest, capabilities_hash,
+    voucher_signing_digest, AgentFields, AuthorizationFields,
+};
 use super::error::Zk402Error;
 use super::facilitator::{
     settle, verify, FailingPublisherAccept, MockPublisherAccept, PublisherAcceptance,
@@ -425,4 +431,239 @@ async fn settle_persists_publisher_acceptance_id() {
         intent.publisher_acceptance_id.as_deref(),
         Some("pubacc_zkv_1")
     );
+}
+
+// ---- session-key delegation enforcement in the settle path ------------------
+
+fn kp(seed: u8) -> (Keypair, String) {
+    let mut sk = [0u8; 32];
+    sk[31] = seed;
+    let k = Keypair::from_seckey_slice(&SECP256K1, &sk).unwrap();
+    let payer = format!(
+        "zkpayer_{}",
+        hex::encode(k.x_only_public_key().0.serialize())
+    );
+    (k, payer)
+}
+
+fn sign_digest(d: &[u8; 32], k: &Keypair) -> String {
+    let m = bitcoin::secp256k1::Message::from_digest_slice(d).unwrap();
+    hex::encode(SECP256K1.sign_schnorr_no_aux_rand(&m, k).serialize())
+}
+
+/// Register `agent_id` (signed by `kp_id`) and delegate a session key to
+/// `sess_pub` with the given per-request cap / merchant allow-list / window.
+#[allow(clippy::too_many_arguments)]
+async fn delegate(
+    pool: &sqlx::PgPool,
+    kp_id: &Keypair,
+    agent_id: &str,
+    sess_pub: &str,
+    merchants: Vec<String>,
+    per_req: i64,
+    va: i64,
+    vb: i64,
+    created_at: i64,
+) {
+    let caps = vec!["pay".to_owned()];
+    let af = AgentFields {
+        agent_id: agent_id.to_owned(),
+        handle: String::new(),
+        capabilities_hash: capabilities_hash(&caps),
+        timestamp: created_at,
+    };
+    register_agent(
+        pool,
+        &RegisterAgent {
+            agent_id: agent_id.to_owned(),
+            handle: None,
+            capabilities: caps,
+            timestamp: created_at,
+            signature: sign_digest(&agent_signing_digest(&af), kp_id),
+        },
+        created_at,
+    )
+    .await
+    .unwrap();
+    let auth = AuthorizationFields {
+        network: "zkcoins:regtest".to_owned(),
+        identity_payer: agent_id.to_owned(),
+        session_pubkey: sess_pub.to_owned(),
+        authorized_amount_sats: 1_000_000,
+        spend_limit_per_request_sats: per_req,
+        spend_limit_total_sats: 1_000_000,
+        allowed_merchants_hash: allowed_merchants_hash(&merchants),
+        facilitator: "https://facilitator.test".to_owned(),
+        valid_after: va,
+        valid_before: vb,
+    };
+    add_session_key(
+        pool,
+        &AddSessionKey {
+            agent_id: agent_id.to_owned(),
+            session_pubkey: sess_pub.to_owned(),
+            network: "zkcoins:regtest".to_owned(),
+            authorized_amount_sats: 1_000_000,
+            spend_limit_per_request_sats: per_req,
+            spend_limit_total_sats: 1_000_000,
+            allowed_merchants: merchants,
+            facilitator: "https://facilitator.test".to_owned(),
+            valid_after: va,
+            valid_before: vb,
+            delegation_signature: sign_digest(&authorization_signing_digest(&auth), kp_id),
+        },
+        created_at,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn settle_enforces_session_key_delegation() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    active_merchant(pool, "merchant_1").await;
+
+    let (kp_id, agent_id) = kp(31);
+    let (kp_sess, sess_payer) = kp(32);
+    let sess_pub = sess_payer.strip_prefix("zkpayer_").unwrap().to_owned();
+    let now = 1_779_900_000;
+    // Per-request cap 1000 sats; only merchant_1 allowed; window covers `now`.
+    delegate(
+        pool,
+        &kp_id,
+        &agent_id,
+        &sess_pub,
+        vec!["merchant_1".to_owned()],
+        1_000,
+        now - 100,
+        now + 100_000,
+        now,
+    )
+    .await;
+
+    // Within caps + allowed merchant → accepted (the delegation passes).
+    let p = signed_payload(
+        &kp_sess,
+        &sess_payer,
+        "merchant_1",
+        "zkv_ok",
+        "n_ok",
+        500,
+        now,
+    );
+    let out = settle(pool, &signer(), &mock_publisher(), &p, now)
+        .await
+        .unwrap();
+    assert_eq!(out.status, "publisher_accepted");
+
+    // Over the per-request cap → rejected, and the persisted intent is failed.
+    let p = signed_payload(
+        &kp_sess,
+        &sess_payer,
+        "merchant_1",
+        "zkv_over",
+        "n_over",
+        5_000,
+        now,
+    );
+    assert!(settle(pool, &signer(), &mock_publisher(), &p, now)
+        .await
+        .is_err());
+    let over = store::load_payment_intent_by_voucher(pool, "zkv_over")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        over.status,
+        super::types::PaymentIntentStatus::FailedTerminal
+    );
+
+    // A merchant NOT in the signed allow-list → rejected (verify() still
+    // needs an active merchant row; the delegation check is what bites).
+    active_merchant(pool, "merchant_2").await;
+    let p = signed_payload(
+        &kp_sess,
+        &sess_payer,
+        "merchant_2",
+        "zkv_wm",
+        "n_wm",
+        500,
+        now,
+    );
+    assert!(settle(pool, &signer(), &mock_publisher(), &p, now)
+        .await
+        .is_err());
+
+    // Revoked session key → rejected.
+    assert!(revoke_session_key(pool, &sess_pub, now).await.unwrap());
+    let p = signed_payload(
+        &kp_sess,
+        &sess_payer,
+        "merchant_1",
+        "zkv_rev",
+        "n_rev",
+        500,
+        now,
+    );
+    assert!(settle(pool, &signer(), &mock_publisher(), &p, now)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn settle_rejects_session_key_outside_window() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    active_merchant(pool, "merchant_1").await;
+
+    let (kp_id, agent_id) = kp(33);
+    let (kp_sess, sess_payer) = kp(34);
+    let sess_pub = sess_payer.strip_prefix("zkpayer_").unwrap().to_owned();
+    let t0 = 1_779_900_000;
+    // Delegation expires at t0+5; created at t0 (still in the future then).
+    delegate(
+        pool,
+        &kp_id,
+        &agent_id,
+        &sess_pub,
+        vec!["merchant_1".to_owned()],
+        1_000,
+        t0 - 10,
+        t0 + 5,
+        t0,
+    )
+    .await;
+
+    // Settle after the delegation window — the voucher itself is still valid
+    // at `now`, so it is the delegation window (not verify()) that rejects.
+    let now = t0 + 10;
+    let p = signed_payload(
+        &kp_sess,
+        &sess_payer,
+        "merchant_1",
+        "zkv_exp",
+        "n_exp",
+        500,
+        now,
+    );
+    assert!(settle(pool, &signer(), &mock_publisher(), &p, now)
+        .await
+        .is_err());
+
+    // An ordinary (non-delegated) payer is untouched by the session-key gate.
+    let (kp_plain, plain_payer) = test_keypair();
+    let p = signed_payload(
+        &kp_plain,
+        &plain_payer,
+        "merchant_1",
+        "zkv_plain",
+        "n_plain",
+        9_999,
+        now,
+    );
+    let out = settle(pool, &signer(), &mock_publisher(), &p, now)
+        .await
+        .unwrap();
+    assert_eq!(out.status, "publisher_accepted");
 }
