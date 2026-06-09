@@ -6,6 +6,8 @@
 //! retry does not double-credit; scanner confirmation advances finality;
 //! interrupted batches resume.
 
+use std::collections::HashMap;
+
 use chrono::Utc;
 
 use crate::test_db::setup_pool;
@@ -13,10 +15,10 @@ use crate::test_db::setup_pool;
 use super::batch::{retry_failed_batch, run_batch_cycle, BatchPolicy};
 use super::error::Zk402Error;
 use super::settlement::{
-    advance_intent_settlement, confirm_batch, confirmations, finalize_batch,
-    record_receive_observation, resume_pending_batches, reverse_intent, revert_reorged_intents,
-    settle_batch, settlement_state_for, BroadcastFailing, MockSettlement, ProverFailing,
-    UnfundedPublisher, FINALITY_CONFIRMATIONS,
+    advance_intent_settlement, confirm_batch, confirmations, detect_and_revert_reorgs,
+    finalize_batch, record_receive_observation, reorg_anchors, resume_pending_batches,
+    reverse_intent, revert_reorged_intents, settle_batch, settlement_state_for, BroadcastFailing,
+    MockSettlement, ProverFailing, UnfundedPublisher, FINALITY_CONFIRMATIONS,
 };
 use super::store;
 use super::types::{
@@ -294,7 +296,7 @@ async fn advance_drives_published_confirmed_final_from_observations() {
     let now = Utc::now().timestamp();
 
     // (a) mempool observation (no block) → published.
-    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, None, now)
+    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, None, None, now)
         .await
         .unwrap();
     assert_eq!(
@@ -305,7 +307,7 @@ async fn advance_drives_published_confirmed_final_from_observations() {
     );
 
     // (b) mined at block 100, tip 100 → 1 conf → confirmed.
-    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(100), now)
+    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(100), None, now)
         .await
         .unwrap();
     assert_eq!(
@@ -380,7 +382,7 @@ async fn advance_is_fail_closed_without_address_observation_or_amount() {
     );
 
     // Underpaid observation (50 < 100) → unchanged, no credit.
-    record_receive_observation(pool, Some("pi1"), "addr_x", 50, Some(100), now)
+    record_receive_observation(pool, Some("pi1"), "addr_x", 50, Some(100), None, now)
         .await
         .unwrap();
     assert_eq!(
@@ -406,7 +408,7 @@ async fn watch_advances_only_address_bound_intents() {
         .await
         .unwrap();
     let now = Utc::now().timestamp();
-    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(100), now)
+    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(100), None, now)
         .await
         .unwrap();
 
@@ -445,7 +447,7 @@ async fn seed_final_intent(pool: &sqlx::PgPool, mid: &str, iid: &str, amount: i6
         .await
         .unwrap();
     let now = Utc::now().timestamp();
-    record_receive_observation(pool, Some(iid), &addr, amount, Some(100), now)
+    record_receive_observation(pool, Some(iid), &addr, amount, Some(100), None, now)
         .await
         .unwrap();
     assert_eq!(
@@ -526,7 +528,7 @@ async fn reorg_reverts_confirmed_intent_then_re_applies_under_new_chain() {
     let now = Utc::now().timestamp();
 
     // Anchored at block 102, tip 104 → 3 confs → confirmed.
-    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(102), now)
+    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(102), None, now)
         .await
         .unwrap();
     assert_eq!(
@@ -555,7 +557,7 @@ async fn reorg_reverts_confirmed_intent_then_re_applies_under_new_chain() {
     );
 
     // The new canonical chain re-includes the transfer at block 150.
-    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(150), now)
+    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(150), None, now)
         .await
         .unwrap();
     assert_eq!(
@@ -584,7 +586,7 @@ async fn reorg_below_inclusion_height_leaves_intent_untouched() {
         .await
         .unwrap();
     let now = Utc::now().timestamp();
-    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(100), now)
+    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(100), None, now)
         .await
         .unwrap();
     assert_eq!(
@@ -605,6 +607,169 @@ async fn reorg_below_inclusion_height_leaves_intent_untouched() {
     );
 }
 
+// --- Reorg DETECTION wiring (hash-anchored, Spec §3.7) -----------------------
+
+/// Seed `pi1` confirmed, anchored at `(height, hash)`. Returns `now`.
+async fn seed_confirmed_at(pool: &sqlx::PgPool, height: i64, hash: &str) -> i64 {
+    seed_merchant_and_intent(pool, "m1", "pi1", 100).await;
+    sqlx::query("UPDATE zk402_payment_intents SET receiving_address = 'addr_pi1' WHERE id = 'pi1'")
+        .execute(pool)
+        .await
+        .unwrap();
+    let now = Utc::now().timestamp();
+    record_receive_observation(
+        pool,
+        Some("pi1"),
+        "addr_pi1",
+        100,
+        Some(height),
+        Some(hash),
+        now,
+    )
+    .await
+    .unwrap();
+    advance_intent_settlement(pool, "pi1", height + 2, now)
+        .await
+        .unwrap();
+    now
+}
+
+#[tokio::test]
+async fn reorg_anchors_lists_only_revertible_intents() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    let _ = seed_confirmed_at(pool, 102, "hash_102").await;
+    // A confirmed intent anchored with a hash IS a reorg anchor.
+    assert_eq!(
+        reorg_anchors(pool).await.unwrap(),
+        vec![(102, "hash_102".to_owned())]
+    );
+
+    // Once final (>= 6 confs), it is reorg-stable and drops out of the anchor set.
+    let now = Utc::now().timestamp();
+    advance_intent_settlement(pool, "pi1", 108, now)
+        .await
+        .unwrap();
+    assert_eq!(
+        store::load_payment_intent(pool, "pi1")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PaymentIntentStatus::Final
+    );
+    assert!(reorg_anchors(pool).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn detect_reverts_when_canonical_hash_diverges_then_reapplies() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    let now = seed_confirmed_at(pool, 102, "hash_102").await;
+
+    // Canonical hash at 102 still matches → no reorg, intent untouched.
+    let mut canonical = HashMap::new();
+    canonical.insert(102, Some("hash_102".to_owned()));
+    assert_eq!(
+        detect_and_revert_reorgs(pool, &canonical, now)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store::load_payment_intent(pool, "pi1")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PaymentIntentStatus::Confirmed
+    );
+
+    // The block at 102 was replaced (different hash) → reorg from 102, reverted.
+    canonical.insert(102, Some("hash_102_PRIME".to_owned()));
+    assert_eq!(
+        detect_and_revert_reorgs(pool, &canonical, now)
+            .await
+            .unwrap(),
+        Some((102, 1))
+    );
+    assert_eq!(
+        store::load_payment_intent(pool, "pi1")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PaymentIntentStatus::Reorged
+    );
+
+    // Re-included under the new chain at 150 → advance re-applies to final.
+    record_receive_observation(
+        pool,
+        Some("pi1"),
+        "addr_pi1",
+        100,
+        Some(150),
+        Some("hash_150"),
+        now,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        advance_intent_settlement(pool, "pi1", 156, now)
+            .await
+            .unwrap(),
+        Some(PaymentIntentStatus::Final)
+    );
+}
+
+#[tokio::test]
+async fn detect_reverts_when_chain_shortened_past_anchor() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    let now = seed_confirmed_at(pool, 102, "hash_102").await;
+    // The watcher found the chain now shorter than the anchor (height -> None).
+    let mut canonical = HashMap::new();
+    canonical.insert(102, None);
+    assert_eq!(
+        detect_and_revert_reorgs(pool, &canonical, now)
+            .await
+            .unwrap(),
+        Some((102, 1))
+    );
+    assert_eq!(
+        store::load_payment_intent(pool, "pi1")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PaymentIntentStatus::Reorged
+    );
+}
+
+#[tokio::test]
+async fn detect_is_fail_closed_on_unresolved_anchor() {
+    let scope = setup_pool().await;
+    let pool = &scope.pool;
+    let now = seed_confirmed_at(pool, 102, "hash_102").await;
+    // A transient fetch failure leaves the anchor height unresolved (absent from
+    // the map) — never a spurious revert.
+    let canonical = HashMap::new();
+    assert_eq!(
+        detect_and_revert_reorgs(pool, &canonical, now)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store::load_payment_intent(pool, "pi1")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        PaymentIntentStatus::Confirmed
+    );
+}
+
 #[tokio::test]
 async fn advance_is_a_noop_when_not_strictly_forward() {
     let scope = setup_pool().await;
@@ -615,7 +780,7 @@ async fn advance_is_a_noop_when_not_strictly_forward() {
         .await
         .unwrap();
     let now = Utc::now().timestamp();
-    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(100), now)
+    record_receive_observation(pool, Some("pi1"), "addr_pi1", 100, Some(100), None, now)
         .await
         .unwrap();
     // tip 100 → 1 conf → confirmed.

@@ -22,6 +22,8 @@
 //! batching-time `accepted` entry flips `pending → posted` at the same
 //! moment, closing the lifecycle.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, TimeZone, Utc};
 use sqlx::PgPool;
 
@@ -349,25 +351,29 @@ fn settle_rank(status: &str) -> i32 {
 
 /// Integration seam: record an on-chain receive crediting a per-intent
 /// receiving address. The real scanner / `/api/receive` path calls this once
-/// a `4242` inscription paying `receiving_address` is integrated (block_height
-/// = the inclusion block, or `None` while still in mempool). Append-only.
+/// a `4242` inscription paying `receiving_address` is integrated. The inclusion
+/// block is anchored by both `block_height` and `block_hash` (each `None` while
+/// still in mempool); the hash is what reorg detection compares against the
+/// canonical chain to spot an orphaned anchor. Append-only.
 pub async fn record_receive_observation(
     pool: &PgPool,
     payment_intent_id: Option<&str>,
     receiving_address: &str,
     amount_sats: i64,
     block_height: Option<i64>,
+    block_hash: Option<&str>,
     now: i64,
 ) -> Result<(), Zk402Error> {
     sqlx::query(
         "INSERT INTO zk402_settlement_observations \
-         (payment_intent_id, receiving_address, amount_sats, block_height, observed_at) \
-         VALUES ($1, $2, $3, $4, $5)",
+         (payment_intent_id, receiving_address, amount_sats, block_height, block_hash, observed_at) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(payment_intent_id)
     .bind(receiving_address)
     .bind(amount_sats)
     .bind(block_height)
+    .bind(block_hash)
     .bind(ts(now))
     .execute(pool)
     .await
@@ -562,4 +568,68 @@ pub async fn revert_reorged_intents(
         .await
         .map_err(db_err)?;
     Ok(ids.len() as u64)
+}
+
+/// Distinct `(block_height, block_hash)` anchors the reorg detector must check:
+/// the confirming blocks of intents that are still reorg-revertible
+/// (`published`/`confirmed`; `final` is reorg-stable at >= 6 confs, §3.9).
+/// Pure DB read — the watcher resolves each height's CURRENT canonical hash and
+/// feeds both into [`detect_and_revert_reorgs`].
+pub async fn reorg_anchors(pool: &PgPool) -> Result<Vec<(i64, String)>, Zk402Error> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT DISTINCT o.block_height, o.block_hash \
+         FROM zk402_settlement_observations o \
+         JOIN zk402_payment_intents pi ON pi.receiving_address = o.receiving_address \
+         WHERE pi.status IN ('published','confirmed') \
+           AND o.block_height IS NOT NULL AND o.block_hash IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(rows)
+}
+
+/// Is the anchor `(height, observed_hash)` orphaned, given the canonical hash
+/// the watcher fetched for that height? `canonical` maps height -> current
+/// canonical hash there: `Some(hash)` if the height is on-chain, `None` if the
+/// chain is now shorter than that height. A height the watcher did not resolve
+/// (absent from the map) is treated as NOT orphaned — never revert on missing
+/// evidence (fail-closed).
+fn anchor_orphaned(
+    height: i64,
+    observed_hash: &str,
+    canonical: &HashMap<i64, Option<String>>,
+) -> bool {
+    match canonical.get(&height) {
+        Some(Some(current)) => current != observed_hash, // hash changed at this height
+        Some(None) => true,                              // height no longer on-chain
+        None => false,                                   // not checked → don't revert
+    }
+}
+
+/// Runtime reorg detection + revert. Given the canonical hashes the watcher
+/// resolved for the current anchor heights, find the LOWEST height whose
+/// anchoring block was orphaned and revert every affected `published`/
+/// `confirmed` intent from there (via [`revert_reorged_intents`], which also
+/// drops the stale observations so the next tick re-applies under the new
+/// chain). Returns `Some((orphaned_from_height, reverted_count))` when a reorg
+/// was handled, `None` when every anchor is still canonical.
+pub async fn detect_and_revert_reorgs(
+    pool: &PgPool,
+    canonical: &HashMap<i64, Option<String>>,
+    now: i64,
+) -> Result<Option<(i64, u64)>, Zk402Error> {
+    let anchors = reorg_anchors(pool).await?;
+    let orphaned_from = anchors
+        .iter()
+        .filter(|(h, observed)| anchor_orphaned(*h, observed, canonical))
+        .map(|(h, _)| *h)
+        .min();
+    match orphaned_from {
+        Some(height) => {
+            let reverted = revert_reorged_intents(pool, height, now).await?;
+            Ok(Some((height, reverted)))
+        }
+        None => Ok(None),
+    }
 }
