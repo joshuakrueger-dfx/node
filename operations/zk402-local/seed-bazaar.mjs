@@ -50,7 +50,13 @@ const CATALOG = [
 ];
 
 async function ensureMerchantKey(m) {
-  if (existsSync(m.keyFile)) return readFileSync(m.keyFile, "utf8").trim();
+  if (existsSync(m.keyFile)) {
+    // Probe the saved key: if the DB was wiped (fresh chain), the stale key
+    // returns 401 and we must re-onboard rather than reuse it.
+    const key = readFileSync(m.keyFile, "utf8").trim();
+    const probe = await fetch(`${API}/api/zk402/dashboard/services`, { headers: { "x-api-key": key } });
+    if (probe.status === 200) return key;
+  }
   const r = await fetch(`${API}/api/zk402/merchants`, {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ merchantId: m.id, displayName: m.name, settlementAddress: m.addr }),
